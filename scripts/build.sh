@@ -60,6 +60,17 @@ docker run --rm \
 
   chmod 644 /dist/*.so
 
+  # A preloaded .so with an unresolved symbol makes the dynamic linker abort
+  # every process it is preloaded into (inject.sh's own date/basename too, so
+  # the respawn comes up without mods). -nostdlib can't resolve libgcc helpers
+  # such as gcc's outline atomics (__aarch64_swp8_* from __atomic_exchange_n).
+  bad=0
+  for so in /dist/*.so; do
+    u=\$(aarch64-linux-gnu-nm -D --undefined-only \"\$so\" | awk '{print \$2}' | grep -vxE 'dlsym' || true)
+    if [ -n \"\$u\" ]; then echo \"[natartos] ERROR: \$so has undefined symbols: \$u\"; bad=1; fi
+  done
+  [ \$bad = 0 ] || exit 1
+
   echo '=== Building binaries ==='
   # fb_receiver: static aarch64 binary for PC streaming
   if [ -f /mods/stream/fb_receiver.c ]; then

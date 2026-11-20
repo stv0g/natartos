@@ -49,6 +49,18 @@ jobs:
             echo "[natartos] $so ($(stat -c%s "dist/$so") bytes)"
           done
 
+      - name: Check preloaded libraries for unresolved symbols
+        # An unresolved symbol in a preloaded .so aborts every process it is
+        # preloaded into (see scripts/build.sh).
+        run: |
+          bad=0
+          for so in dist/*.so src/*.so; do
+            [ -f "$so" ] || continue
+            u=$(aarch64-linux-gnu-nm -D --undefined-only "$so" | awk '{print $2}' | grep -vxE 'dlsym' || true)
+            if [ -n "$u" ]; then echo "::error::$so has undefined symbols: $u"; bad=1; fi
+          done
+          exit $bad
+
       - name: Build fb_receiver
         run: aarch64-linux-gnu-gcc -static -O2 -I include -o dist/fb_receiver mods/stream/fb_receiver.c -lm
 
