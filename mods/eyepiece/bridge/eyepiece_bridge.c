@@ -13,14 +13,18 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/input.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -171,29 +175,70 @@ static void *pose_thread(void *arg) {
 }
 
 /* ---- Back key (optional, for menu launches) ------------------------------ */
+/* Open the input device whose name is `want` (event numbers depend on probe
+ * order and on dji_glasses creating omc_keys as uinput); fallback path if no
+ * name matches. */
+static int open_input(const char *want, const char *fallback) {
+    char path[32], name[64];
+    for (int n = 0; n < 10; n++) {
+        snprintf(path, sizeof(path), "/dev/input/event%d", n);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) > 0) {
+            name[sizeof(name) - 1] = 0;
+            if (strcmp(name, want) == 0) return fd;
+        }
+        close(fd);
+    }
+    return open(fallback, O_RDONLY | O_CLOEXEC);
+}
+
+/* -b: the goggles' buttons belong to the bridge while it runs. Both key
+ * devices are grabbed (like Doom does), so the hidden GUI does not navigate
+ * behind the overlay — the overlay restores the GUI's last picture on exit,
+ * which is only right if the GUI did not change meanwhile. A Back click
+ * (< 1.5 s) or a long hold both exit; the overlay's own long-hold exit can't
+ * see the key while it is grabbed. Nothing counts in the first 2 s: a stray
+ * Back event was seen once right after a dji_glasses restart. The grab ends
+ * with the process.                                                        */
 static void *back_thread(void *arg) {
     (void)arg;
     struct { long sec, usec; uint16_t type, code; int32_t value; } ev;
-    int fd = open("/dev/input/event0", O_RDONLY);
-    if (fd < 0) { vlog("back: cannot open event0: %s", strerror(errno)); return NULL; }
-    /* A full click only: press then release within 1.5 s (longer = the
-     * overlay's own long-hold exit), and nothing in the first 2 s — a stray
-     * Back event (seen once right after a dji_glasses restart)
-     * must not end the session.                                            */
+    struct pollfd pf[2] = {
+        { .fd = open_input("gpio_keys", "/dev/input/event0"), .events = POLLIN },
+        { .fd = open_input("omc_keys",  "/dev/input/event3"), .events = POLLIN },
+    };
+    if (pf[0].fd < 0) { vlog("back: cannot open gpio_keys: %s", strerror(errno)); return NULL; }
+    for (int i = 0; i < 2; i++)
+        if (pf[i].fd >= 0 && ioctl(pf[i].fd, EVIOCGRAB, 1) < 0)
+            vlog("back: grab %d failed: %s", i, strerror(errno));
+    vlog("back: buttons grabbed (gpio_keys%s)", pf[1].fd >= 0 ? " + omc_keys" : "");
     uint64_t t_start = now_us(), t_down = 0;
-    while (!g_exit && read(fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-        if (ev.type != 1 /* EV_KEY */ || ev.code != 158 /* KEY_BACK */) continue;
+    while (!g_exit) {
+        int r = poll(pf, pf[1].fd >= 0 ? 2 : 1, 100);
+        if (r < 0 && errno != EINTR) break;
         uint64_t t = now_us();
+        if (t_down && t - t_down >= 1500000) {      /* long hold, no release needed */
+            vlog("Back held → exiting");
+            g_exit = 1;
+            break;
+        }
+        if (r <= 0) continue;
+        if (pf[1].fd >= 0 && (pf[1].revents & POLLIN))
+            (void)!read(pf[1].fd, &ev, sizeof(ev));   /* 5D: swallowed */
+        if (!(pf[0].revents & POLLIN)) continue;
+        if (read(pf[0].fd, &ev, sizeof(ev)) != (ssize_t)sizeof(ev)) break;
+        if (ev.type != EV_KEY || ev.code != KEY_BACK) continue;
         vlog("back: key %s at +%.2f s", ev.value ? "down" : "up", (t - t_start) / 1e6);
         if (t - t_start < 2000000) { t_down = 0; continue; }
         if (ev.value == 1) { t_down = t; continue; }
-        if (ev.value == 0 && t_down && t - t_down < 1500000) {
+        if (ev.value == 0 && t_down) {
             vlog("Back clicked → exiting");
             g_exit = 1;               /* pose_thread wakes accept()/recv() */
         }
         t_down = 0;
     }
-    close(fd);
+    for (int i = 0; i < 2; i++) if (pf[i].fd >= 0) close(pf[i].fd);
     return NULL;
 }
 
@@ -495,6 +540,39 @@ static void usage(const char *a0) {
         a0, EP_PORT, EP_PORT, EP_PORT);
 }
 
+/* One bridge at a time, the newest wins. A second bridge (menu tap while a
+ * PC-deployed one runs, or the other way round) used to fail on the busy port
+ * and, on its way out, overwrite the log and delete the running bridge's
+ * fb_shared/fb_override, which hid it. Now the newcomer asks the holder of
+ * eyepiece.lock to shut down cleanly (SIGTERM: stops head tracking, hands the
+ * display back), waits for the lock, and only then touches shared state. The
+ * lock is inherited by the head-tracking helper, so it is free only once the
+ * old MCU stream is stopped too.                                           */
+static int g_took_over = 0;
+static int take_over(void) {
+    int fd = open(tmp_path("eyepiece.lock"), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (fd < 0) return 0;                        /* no lock dir: old behaviour */
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        char b[16] = {0};
+        (void)!pread(fd, b, sizeof(b) - 1, 0);
+        pid_t old = (pid_t)atoi(b);
+        fprintf(stderr, "another bridge (pid %d) is running: asking it to exit\n", (int)old);
+        if (old > 1) kill(old, SIGTERM);
+        int ok = 0;
+        for (int i = 0; i < 50 && !ok; i++) { usleep(100000); ok = flock(fd, LOCK_EX | LOCK_NB) == 0; }
+        if (!ok && old > 1) {
+            kill(old, SIGKILL);                  /* its helper stops the MCU on parent death */
+            for (int i = 0; i < 30 && !ok; i++) { usleep(100000); ok = flock(fd, LOCK_EX | LOCK_NB) == 0; }
+        }
+        if (!ok) { close(fd); return -1; }
+        g_took_over = 1;
+    }
+    char b[16];
+    int n = snprintf(b, sizeof(b), "%d\n", (int)getpid());
+    if (ftruncate(fd, 0) == 0) (void)!pwrite(fd, b, (size_t)n, 0);
+    return 0;                                    /* fd stays open = lock held */
+}
+
 int main(int argc, char **argv) {
     int o;
     while ((o = getopt(argc, argv, "p:As:t:c:fVHb1ND:F:S:L:O:TMQ:l:Zh")) != -1) {
@@ -540,7 +618,21 @@ int main(int argc, char **argv) {
     }
     if (opt_null_dec) opt_hw = 0;
     opt_hw_tune.direct_vops = opt_hw ? opt_direct : 0;
-    if (!opt_log) opt_log = tmp_path("eyepiece.log");
+    if (take_over() < 0) {
+        fprintf(stderr, "another bridge did not exit; giving up\n");
+        _exit(1);
+    }
+    /* the overlay may still be cleaning up after the previous app (it pokes
+     * the GUI with key events for ~2 s); don't grab the keys or claim the
+     * screen before it is done                                           */
+    if (g_took_over) usleep(300000);   /* let the overlay notice the old bridge left */
+    for (int i = 0; i < 50 && access(tmp_path("fb_cleanup"), F_OK) == 0; i++) usleep(100000);
+    if (!opt_log) {
+        opt_log = tmp_path("eyepiece.log");
+        char prev[300];
+        snprintf(prev, sizeof(prev), "%s.1", opt_log);
+        rename(opt_log, prev);                   /* keep the previous session's log */
+    }
     if (strcmp(opt_log, "-")) g_log = fopen(opt_log, "w");
 
     struct sigaction sa;
