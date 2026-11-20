@@ -74,7 +74,11 @@ while true; do
     crash_count=$((crash_count + 1))
 
     if [ "$crash_count" -ge "$MAX_CRASHES" ]; then
-        log "GIVE UP: $crash_count crashes in ${elapsed}s"
+        log "GIVE UP: $crash_count crashes in ${elapsed}s — restarting stock dji_glasses (no mods)"
+        rm -f /data/local/tmp/fb_stop /data/local/tmp/fb_override
+        # hand the UI back to init's stock service (no LD_PRELOAD) instead of
+        # leaving the goggles without a UI until the next reboot
+        start dji_glasses 2>/dev/null
         break
     fi
 
