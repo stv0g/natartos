@@ -67,7 +67,7 @@ while true; do
     # Each fresh dji_glasses starts clean: drop runtime overlay flags a previous
     # session (or the respawn before this one) left behind. A stale fb_stop
     # otherwise makes the new overlay run cleanup→restart on every boot forever.
-    rm -f /data/local/tmp/fb_stop /data/local/tmp/fb_override
+    rm -f /data/local/tmp/fb_stop /data/local/tmp/fb_override /data/local/tmp/fb_cleanup
     PRELOAD=$(build_preload)
     export LD_PRELOAD="$PRELOAD"
     log "start dji_glasses LD_PRELOAD=$PRELOAD"
@@ -93,7 +93,7 @@ while true; do
 
     if [ "$crash_count" -ge "$MAX_CRASHES" ]; then
         log "GIVE UP: $crash_count crashes in ${elapsed}s — restarting stock dji_glasses (no mods)"
-        rm -f /data/local/tmp/fb_stop /data/local/tmp/fb_override
+        rm -f /data/local/tmp/fb_stop /data/local/tmp/fb_override /data/local/tmp/fb_cleanup
         # hand the UI back to init's stock service (no LD_PRELOAD) instead of
         # leaving the goggles without a UI until the next reboot
         start dji_glasses 2>/dev/null

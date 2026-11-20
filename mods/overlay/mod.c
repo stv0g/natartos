@@ -335,6 +335,41 @@ static int find_all_framebuffers(void) {
     return local_count;
 }
 
+/* The inject thread paints app frames straight into the GUI's own scanout
+ * buffers. The GUI repaints only what changed, so after an app exits the rest
+ * of its last frame stayed visible until enough of the UI was redrawn. Save the
+ * GUI's buffers before the first app frame and put them back on exit (anonymous
+ * memory, only while an app is shown). */
+static void *g_saved_fb[MAX_FRAMEBUFFERS];
+static int g_saved_count = 0;
+
+static void save_gui_framebuffers(int fbc) {
+    if (g_saved_count) return;
+    for (int i = 0; i < fbc; i++) {
+        void *m = sys_mmap(0, FRAME_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if ((long)m < 0 && (long)m > -4096) {
+            NTLOG_INT("fbsave: mmap failed, saved=", i);
+            break;
+        }
+        my_memcpy(m, g_framebuffers[i], FRAME_SIZE);
+        g_saved_fb[i] = m;
+        g_saved_count = i + 1;
+    }
+    NTLOG_INT("fbsave: saved GUI buffers=", g_saved_count);
+}
+
+static void restore_gui_framebuffers(void) {
+    int n = g_saved_count;
+    for (int i = 0; i < n; i++) {
+        my_memcpy(g_framebuffers[i], g_saved_fb[i], FRAME_SIZE);
+        sys_munmap(g_saved_fb[i], FRAME_SIZE);
+        g_saved_fb[i] = 0;
+    }
+    g_saved_count = 0;
+    if (n) NTLOG_INT("fbsave: restored GUI buffers=", n);
+}
+
 /* ---- Screencap ---- */
 
 static void write_status(const char *msg) {
@@ -544,7 +579,32 @@ static int inject_ui_repaint(void) {
     return woke;
 }
 
+/* Set while overlay_cleanup runs (it sleeps ~2 s probing the GUI). The
+ * watcher must not start the next app's session meanwhile: the cleanup's
+ * input pokes and repaint probe would hit the new session (a newly started
+ * app that grabs the keys received the fallback BACK and exited). */
+static volatile int g_cleanup_busy = 0;
+
+static void overlay_cleanup_inner(void);
+#define CLEANUP_FLAG "/data/local/tmp/fb_cleanup"   /* apps wait while it exists */
+static long sys_unlinkat(int dirfd, const char *path, int flags) {
+    register long x0 __asm__("x0") = dirfd;
+    register long x1 __asm__("x1") = (long)path;
+    register long x2 __asm__("x2") = flags;
+    register long x8 __asm__("x8") = 35;   /* __NR_unlinkat (arm64) */
+    __asm__ volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory");
+    return x0;
+}
 static void overlay_cleanup(void) {
+    __atomic_store_n(&g_cleanup_busy, 1, __ATOMIC_RELEASE);
+    int fd = (int)sys_openat(AT_FDCWD, CLEANUP_FLAG, O_WRONLY | O_CREAT, 0666);
+    if (fd >= 0) sys_close(fd);
+    overlay_cleanup_inner();
+    sys_unlinkat(AT_FDCWD, CLEANUP_FLAG, 0);
+    __atomic_store_n(&g_cleanup_busy, 0, __ATOMIC_RELEASE);
+}
+
+static void overlay_cleanup_inner(void) {
     NTLOG("cleanup: stopping overlay");
     g_inject_active = 0;
     if (g_inject_fd >= 0) { sys_close(g_inject_fd); g_inject_fd = -1; }
@@ -572,6 +632,8 @@ static void overlay_cleanup(void) {
            "do usleep 25000; i=$((i+1)); done");
     g_post_exit_pushes = 0;
     g_exited_once = 1;
+
+    restore_gui_framebuffers();
 
     /* Hand the GUI's held-back frames to the display (see g_pending_buf). */
     int replayed = 0;
@@ -646,6 +708,7 @@ static void *inject_thread_fn(void *arg) {
 
         /* Read the published FRONT slot (counter & 1); fb_receiver wrote the
          * other slot, so this copy can't catch a frame mid-write. */
+        save_gui_framebuffers(fbc);
         long slot_off = SHM_HEADER_G + (long)(counter & 1u) * FRAME_SIZE;
         long total = 0;
         while (total < FRAME_SIZE) {
@@ -683,7 +746,9 @@ static void *watcher_thread_fn(void *arg) {
     int logged_no_shm = 0;
     while (1) {
         sys_nanosleep(&ts, 0);
-        if (g_inject_active) { cooldown = 4; logged_no_shm = 0; continue; }
+        if (g_inject_active || __atomic_load_n(&g_cleanup_busy, __ATOMIC_ACQUIRE)) {
+            cooldown = 4; logged_no_shm = 0; continue;
+        }
         if (cooldown > 0) { cooldown--; continue; }
         if (sys_faccessat(AT_FDCWD, OVR, 0) != 0) continue;
         int fd = (int)sys_openat(AT_FDCWD, SHM, O_RDONLY, 0);
