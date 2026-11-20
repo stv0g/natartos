@@ -43,6 +43,13 @@
 
 #define EV_KEY   1
 #define KEY_BACK 158
+/* omc_keys directions; the EW input manager (system/etc/gui/zv902_gui_input.json)
+ * maps the same Linux codes, so they reach dji_glasses' scene. */
+#define KEY_UP    103
+#define KEY_DOWN  108
+#define KEY_LEFT  105
+#define KEY_RIGHT 106
+#define EVIOCGNAME_64 0x80404506UL   /* _IOC(_IOC_READ, 'E', 0x06, 64) */
 struct input_event_t { long sec, usec; unsigned short type, code; int value; };
 
 #define FRAME_SIZE 8294400L
@@ -417,9 +424,18 @@ static volatile int g_post_exit_pushes = 0;
 
 static int g_push_count = 0;
 
+/* The GUI frame swallowed most recently while injecting, per plane. The GUI
+ * does not render again until a pushed frame is handed to the display, so a
+ * frame it rendered during the overlay (e.g. navigating on the same Back press
+ * that exits an app) leaves it stalled after the overlay stops: no input wakes
+ * it. overlay_cleanup submits these to the real push_frame once to release it. */
+#define PENDING_SLOTS 8
+static void *volatile g_pending_handle[PENDING_SLOTS];
+static void *volatile g_pending_buf[PENDING_SLOTS];
+
 static void start_inject_thread(void);
 
-/* Write one key press+release (with SYN reports) to /dev/input/event0. */
+/* Write one key press+release (with SYN reports) to an evdev fd. */
 static void emit_key(int fd, unsigned short code) {
     struct input_event_t ev[4] = {
         { 0, 0, EV_KEY, code, 1 },
@@ -435,35 +451,95 @@ static void emit_key(int fd, unsigned short code) {
     sys_write(fd, &ev[3], sizeof(ev[3]));
 }
 
-/* Force a UI repaint after an app exits. The GUI is a reactive EW scene that
- * only paints on invalidation, so we feed it an input event. We use BACK, NOT
- * ENTER: on the menu the just-exited app is the highlighted item, and ENTER
- * would re-launch it (observed: Doom relaunched, PC Stream bounced to restart).
- * BACK navigates back / to home — it still dirties the scene (→ repaint) but
- * never activates an item. Retried until the GUI actually pushes a frame
- * (g_post_exit_pushes advances), so it survives the app's event0 grab lingering
- * a few ms after death; if it never wakes, the caller falls back to a restart. */
-static int inject_ui_repaint(void) {
-    int fd = (int)sys_openat(AT_FDCWD, "/dev/input/event0", 1 /*O_WRONLY*/, 0);
-    if (fd < 0) { NTLOG("repaint: open event0 failed"); return 0; }
+/* Open an input device by name, e.g. "omc_keys". The GUI input config selects
+ * devices by name (system/etc/gui/zv902_gui_input.json), while event numbers
+ * are assigned by probe order and can change between firmware builds. */
+static int open_event_by_name(const char *want) {
+    static const char tmpl[] = "/dev/input/event0";
+    char path[sizeof(tmpl)];
+    my_memcpy(path, tmpl, sizeof(tmpl));
+    for (int n = 0; n < 10; n++) {
+        path[sizeof(tmpl) - 2] = (char)('0' + n);
+        int fd = (int)sys_openat(AT_FDCWD, path, O_RDONLY, 0);
+        if (fd < 0) continue;
+        char name[64];
+        long r = sys_ioctl(fd, EVIOCGNAME_64, (unsigned long)name);
+        sys_close(fd);
+        if (r <= 0) continue;
+        name[sizeof(name) - 1] = 0;
+        if (my_strncmp(name, want, sizeof(name)) == 0)
+            return (int)sys_openat(AT_FDCWD, path, O_WRONLY, 0);
+    }
+    return -1;
+}
 
-    struct timespec_t settle = { 0, 150000000 };   /* grab fully released */
+/* Force a UI repaint after an app exits. The GUI is a reactive EW scene that
+ * only paints on invalidation, so we feed it input events.
+ *
+ * Do NOT use ENTER: on the menu the just-exited app is the highlighted item
+ * and ENTER re-launches it (observed: Doom relaunched, PC Stream bounced to
+ * restart). BACK is safe but only invalidates when there is something to go
+ * back from. Apps that do not grab event0 (e.g. the eyepiece bridge) let
+ * their own Back press navigate the hidden GUI home, so a BACK sent here is a
+ * no-op (the UI beeps), no frame is pushed, and the old code fell back to
+ * restarting dji_glasses on every exit.
+ *
+ * Directions (omc_keys) move the focus on any screen — home included — and
+ * never activate an item. Send each pair down+up / right+left so the
+ * selection is left where it was. Retry until the GUI pushes a frame
+ * (g_post_exit_pushes advances); only then fall back to BACK and, if nothing
+ * wakes it, to the restart. */
+static int inject_ui_repaint(void) {
+    int back = (int)sys_openat(AT_FDCWD, "/dev/input/event0", O_WRONLY, 0);
+    int nav  = open_event_by_name("omc_keys");
+    if (back < 0 && nav < 0) { NTLOG("repaint: no input device"); return 0; }
+
+    struct timespec_t settle = { 0, 150000000 };   /* app's input device closed */
     sys_nanosleep(&settle, 0);
 
     /* If the GUI already repainted on its own (happens right after a fresh
      * dji_glasses start), leave it be — don't navigate. */
     struct timespec_t probe = { 0, 300000000 };
     sys_nanosleep(&probe, 0);
-    if (g_post_exit_pushes > 0) { sys_close(fd); NTLOG("repaint: self-recovered"); return 1; }
-
-    struct timespec_t wait = { 0, 250000000 };
-    int woke = 0;
-    for (int tries = 0; tries < 8; tries++) {
-        emit_key(fd, 158);            /* KEY_BACK → navigate back, dirties the scene, never launches */
-        sys_nanosleep(&wait, 0);
-        if (g_post_exit_pushes > 0) { woke = 1; break; }
+    if (g_post_exit_pushes > 0) {
+        if (back >= 0) sys_close(back);
+        if (nav >= 0) sys_close(nav);
+        NTLOG("repaint: self-recovered");
+        return 1;
     }
-    sys_close(fd);
+
+    struct timespec_t wait = { 0, 200000000 };
+    unsigned int before = (unsigned int)g_post_exit_pushes;
+    int woke = 0;
+
+    if (nav >= 0) {
+        static const unsigned short pairs[2][2] = {
+            { KEY_DOWN, KEY_UP }, { KEY_RIGHT, KEY_LEFT }
+        };
+        for (int p = 0; p < 2 && !woke; p++) {
+            for (int tries = 0; tries < 2 && !woke; tries++) {
+                before = (unsigned int)g_post_exit_pushes;
+                emit_key(nav, pairs[p][0]);
+                sys_nanosleep(&wait, 0);
+                emit_key(nav, pairs[p][1]);   /* restore the selection */
+                sys_nanosleep(&wait, 0);
+                if (g_post_exit_pushes != before) woke = 1;
+            }
+        }
+    }
+
+    /* Only if no direction woke the scene: BACK can still close an open menu. */
+    if (!woke && back >= 0) {
+        for (int tries = 0; tries < 2 && !woke; tries++) {
+            before = (unsigned int)g_post_exit_pushes;
+            emit_key(back, KEY_BACK);
+            sys_nanosleep(&wait, 0);
+            if (g_post_exit_pushes != before) woke = 1;
+        }
+    }
+
+    if (back >= 0) sys_close(back);
+    if (nav >= 0) sys_close(nav);
     NTLOG_INT("repaint: woke=", woke);
     return woke;
 }
@@ -496,6 +572,20 @@ static void overlay_cleanup(void) {
            "do usleep 25000; i=$((i+1)); done");
     g_post_exit_pushes = 0;
     g_exited_once = 1;
+
+    /* Hand the GUI's held-back frames to the display (see g_pending_buf). */
+    int replayed = 0;
+    for (int i = 0; i < PENDING_SLOTS && g_real_push_frame; i++) {
+        /* load + store, not exchange: an exchange compiles to a libgcc
+         * outline-atomic call (__aarch64_swp8_*) that -nostdlib can't resolve,
+         * and a preload with an undefined symbol kills every process. */
+        void *buf = __atomic_load_n(&g_pending_buf[i], __ATOMIC_ACQUIRE);
+        if (!buf) continue;
+        __atomic_store_n(&g_pending_buf[i], (void *)0, __ATOMIC_RELEASE);
+        g_real_push_frame(g_pending_handle[i], i, buf);
+        replayed++;
+    }
+    NTLOG_INT("cleanup: replayed held frames=", replayed);
 
     /* Fast path: force the GUI to re-render the now-unoccluded home UI in
      * process. The compositor only paints on scene invalidation and the app's
@@ -696,8 +786,16 @@ int duss_hal_display_push_frame(void *display_handle, int plane_id, void *frame_
     /* While injecting, the inject thread paints the scanout dmabufs directly;
      * skip the real submit so the compositor's own frames don't fight ours
      * (that caused flicker). push_frame returns 0 on success, so 0 is correct. */
-    if (g_inject_active)
+    if (g_inject_active) {
+        if (plane_id >= 0 && plane_id < PENDING_SLOTS) {
+            g_pending_handle[plane_id] = display_handle;
+            __atomic_store_n(&g_pending_buf[plane_id], frame_buf, __ATOMIC_RELEASE);
+        }
         return 0;
+    }
+    /* a live push supersedes any frame held back for this plane */
+    if (plane_id >= 0 && plane_id < PENDING_SLOTS)
+        __atomic_store_n(&g_pending_buf[plane_id], (void *)0, __ATOMIC_RELEASE);
 
     if (g_real_push_frame)
         return g_real_push_frame(display_handle, plane_id, frame_buf);
