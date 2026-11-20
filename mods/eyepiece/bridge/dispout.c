@@ -66,6 +66,14 @@ typedef struct __attribute__((packed)) {
     int32_t  voffset;         /* 0x14 */
 } disp_blend_t;               /* 0x18 */
 
+/* No plane scaling: /proc/display/feature lists no "scale" capability for any
+ * plane on this display controller (VIDEO0: crop, blend, dimming, …), and
+ * duss_hal_display_plane_scale_set returns -1001. A stream smaller than the
+ * panel is shown 1:1, centred with the blending offset.                    */
+
+#define PANEL_W 1920
+#define PANEL_H 1080
+
 struct dispout {
     void *dev;
     void *disp[MAX_VOP];
@@ -162,13 +170,16 @@ static void metrics_report(dispout_t *o) {
     pthread_mutex_unlock(&o->mu);
 }
 
-dispout_t *dispout_open(int vop_mask, dispout_release_cb release, void *user) {
+dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb release, void *user) {
     if (load() < 0) return NULL;
     dispout_t *o = calloc(1, sizeof(*o));
     if (!o) return NULL;
     pthread_mutex_init(&o->mu, NULL);
     o->release = release; o->user = user;
     o->metrics = getenv("EYEPIECE_METRICS") != NULL;
+    /* stream smaller than the panel: 1:1, centred (no plane scaler) */
+    int need_center = src_w > 0 && src_h > 0 && src_w <= PANEL_W && src_h <= PANEL_H &&
+                      (src_w != PANEL_W || src_h != PANEL_H);
     uint32_t zero = 0;
     int r = D.device_open("/dev/dji_display", &zero, &o->dev);
     if (r != 0) { vlog("dispout: open /dev/dji_display: %d", r); free(o); return NULL; }
@@ -185,8 +196,12 @@ dispout_t *dispout_open(int vop_mask, dispout_release_cb release, void *user) {
         }
         disp_blend_t b = { .enable = 1, .glb_alpha_en = 1, .glb_alpha_val = 255,
                            .alg = 0, .order = 0, .pos = 0 };
+        if (need_center) { b.hoffset = ((PANEL_W - src_w) / 2) & ~1; b.voffset = ((PANEL_H - src_h) / 2) & ~1; }
         if ((r = D.blending_set(disp, plane, &b)) != 0)
             vlog("dispout: blending_set vop %d plane %d: %d", vop, plane, r);
+        if (need_center)
+            vlog("dispout: vop %d: %dx%d stream shown 1:1 centred at +%d+%d", vop, src_w, src_h,
+                 b.hoffset, b.voffset);
         if ((r = D.register_frame_cycle_callback(disp, plane, on_pop, o)) != 0)
             vlog("dispout: frame-cycle callback vop %d: %d (frames will be recycled late)", vop, r);
         const char *q = getenv("EYEPIECE_QSYNC");

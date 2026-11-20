@@ -62,7 +62,8 @@ void hwdec_close(hwdec_t *d);
 /* dispout.c — zero-copy NV12 scan-out on DUSS_DISP_PLANE_VIDEO0 (experimental) */
 typedef struct dispout dispout_t;
 typedef void (*dispout_release_cb)(void *user, void *fb);
-dispout_t *dispout_open(int vop_mask, dispout_release_cb release, void *user);
+/* src_w/src_h: stream size; ≠ 1920x1080 → plane scaler to the panel (aspect kept) */
+dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb release, void *user);
 int  dispout_push(dispout_t *o, void *fb);
 void dispout_close(dispout_t *o);
 void dispout_qsync_off(void);

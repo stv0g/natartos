@@ -320,7 +320,7 @@ hwdec_t *hwdec_open(int codec, int w, int h, int nframes, int sync_dir,
     r = hal.device_start(d->vdec, &sc);
     if (r != 0) { vlog("hwdec: vdec0 start: %d", r); return NULL; }
     if (tune && tune->direct_vops) {
-        d->disp = dispout_open(tune->direct_vops, disp_release, d);
+        d->disp = dispout_open(tune->direct_vops, w, h, disp_release, d);
         if (!d->disp) vlog("hwdec: direct scan-out unavailable → converting into fb_shared");
     }
     for (int i = 0; i < d->nframe; i++)
