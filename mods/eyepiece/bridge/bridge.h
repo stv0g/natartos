@@ -53,6 +53,7 @@ typedef struct {
     int no_reorder, flag24, val2c;   /* -L r,f,v  start-config knobs              */
     int direct_vops;                 /* -O plane[:mask]: VOP bitmask for zero-copy
                                         scan-out on VIDEO0 (0 = convert into fb_shared) */
+    int stereo;                      /* SBS stream: 3D display timing (1901), 0 = mono */
 } hwdec_tune_t;
 hwdec_t *hwdec_open(int codec, int w, int h, int nframes, int sync_dir,
                     const hwdec_tune_t *tune, hwdec_frame_cb cb, void *user);
@@ -63,11 +64,13 @@ void hwdec_close(hwdec_t *d);
 typedef struct dispout dispout_t;
 typedef void (*dispout_release_cb)(void *user, void *fb);
 /* src_w/src_h: stream size; ≠ 1920x1080 → plane scaler to the panel (aspect kept) */
-dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb release, void *user);
+dispout_t *dispout_open(int vop_mask, int src_w, int src_h, int stereo_res, dispout_release_cb release, void *user);
 int  dispout_push(dispout_t *o, void *fb);
 void dispout_close(dispout_t *o);
 void dispout_qsync_off(void);
 void dispout_stereo_off(void);
+void dispout_reset_stale_3d(void);
+int  hwdec_hal_init(void);
 
 /* rndis.c — USB network (RNDIS + DHCP) next to adb; 0 = active */
 int rndis_setup(void);

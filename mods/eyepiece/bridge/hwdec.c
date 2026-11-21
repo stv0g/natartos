@@ -152,6 +152,9 @@ static int load_hal(int with_display) {
     return 0;
 }
 
+/* duss HAL with the display registered (once per process; dispout's stale-3D reset) */
+int hwdec_hal_init(void) { return load_hal(1); }
+
 /* ---- decoder callbacks (run on the decoder's threads) ------------------ */
 
 static int cb_strm_empty(void *user, void *desc) {
@@ -320,7 +323,7 @@ hwdec_t *hwdec_open(int codec, int w, int h, int nframes, int sync_dir,
     r = hal.device_start(d->vdec, &sc);
     if (r != 0) { vlog("hwdec: vdec0 start: %d", r); return NULL; }
     if (tune && tune->direct_vops) {
-        d->disp = dispout_open(tune->direct_vops, w, h, disp_release, d);
+        d->disp = dispout_open(tune->direct_vops, w, h, tune->stereo, disp_release, d);
         if (!d->disp) vlog("hwdec: direct scan-out unavailable → converting into fb_shared");
     }
     for (int i = 0; i < d->nframe; i++)

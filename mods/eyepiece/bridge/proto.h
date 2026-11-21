@@ -56,8 +56,16 @@ typedef struct __attribute__((packed)) {
     uint16_t width, height;
     uint8_t  codec;    /* EP_CODEC_*                                            */
     uint8_t  fps;
-    uint16_t rsv;
+    uint8_t  layout;   /* EP_LAYOUT_* (older PCs send 0 = mono)                 */
+    uint8_t  rsv;
 } ep_stream_t;
+/* EP_LAYOUT_SBS: the two eyes side by side (left | right), 2560x720 = 1280x720 per eye,
+ * shown in the goggles' 3D display mode (VOP0 left eye, VOP1 right eye, ~60 Hz). Only
+ * when ep_info_t.flags has EP_INFO_STEREO; sent once per connection like the rest of
+ * ep_stream_t (no per-frame cost).                                                    */
+enum { EP_LAYOUT_MONO = 0, EP_LAYOUT_SBS = 1 };
+#define EP_SBS_EYE_W 1280
+#define EP_SBS_EYE_H 720
 
 enum { EP_POSE_SRC_MCU = 3 };   /* 1, 2: retired drone-fed sources (arhome push, hook) */
 
@@ -86,7 +94,9 @@ typedef struct __attribute__((packed)) {
     uint16_t fb_w, fb_h;   /* output framebuffer size                           */
     uint8_t  decoder;      /* 0 = none, 1 = software (libavcodec), 2 = hardware (VC8000D) */
     uint8_t  headtrack;    /* bit0 = MCU attitude stream received                */
-    uint16_t rsv;
+    uint8_t  flags;        /* EP_INFO_* capabilities (older bridges: 0)          */
+    uint8_t  rsv;
 } ep_info_t;
+#define EP_INFO_STEREO 0x01    /* understands ep_stream_t.layout = EP_LAYOUT_SBS    */
 
 #endif
