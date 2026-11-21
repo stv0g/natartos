@@ -470,6 +470,11 @@ static void *volatile g_pending_buf[PENDING_SLOTS];
 
 static void start_inject_thread(void);
 
+/* GUI display handle and plane, from the GUI's own push_frame calls (for the
+ * gui_hide blending switch below). */
+static void *volatile g_gui_handle;
+static volatile int g_gui_plane = -1;
+
 /* Write one key press+release (with SYN reports) to an evdev fd. */
 static void emit_key(int fd, unsigned short code) {
     struct input_event_t ev[4] = {
@@ -847,6 +852,11 @@ int duss_hal_display_push_frame(void *display_handle, int plane_id, void *frame_
 
     if (g_push_count == 1)
         NTLOG("push_frame: HOOK ALIVE");
+    if (plane_id >= 0 && plane_id < 8 && g_gui_plane < 0) {
+        g_gui_handle = display_handle;
+        g_gui_plane = plane_id;
+        NTLOG_INT("gui_hide: GUI plane=", plane_id);
+    }
 
     /* While injecting, the inject thread paints the scanout dmabufs directly;
      * skip the real submit so the compositor's own frames don't fight ours
@@ -865,6 +875,102 @@ int duss_hal_display_push_frame(void *display_handle, int plane_id, void *frame_
     if (g_real_push_frame)
         return g_real_push_frame(display_handle, plane_id, frame_buf);
     return 0;
+}
+
+/* ---- gui_hide: hide the GUI plane at the display, buffers untouched ----
+ *
+ * For apps that show their picture on their own display plane (eyepiece:
+ * VIDEO0 below the GUI). Painting app frames into the GUI's scanout buffers
+ * (fb_shared) needs the GUI's picture restored and a forced repaint on exit;
+ * the GUI redraws only dirty regions, so leftovers and partly black screens
+ * were possible, and the repaint pokes beep. Instead the GUI plane gets
+ * global alpha 0 while the app runs: the GUI keeps rendering normally (its
+ * frames are not swallowed), so its picture is current when it comes back.
+ *
+ * Protocol: the app creates /data/local/tmp/gui_hide and holds flock(LOCK_EX)
+ * on it for as long as the GUI should stay hidden. The overlay acknowledges
+ * with /data/local/tmp/gui_hidden. File removed, or lock free (the app died:
+ * the kernel drops the lock) → stock blending restored, ack removed. Polled
+ * every 20 ms. The blending must be set from this process: the display
+ * driver only lets the plane's owner change it.                          */
+#define GUI_HIDE_PATH   "/data/local/tmp/gui_hide"
+#define GUI_HIDDEN_PATH "/data/local/tmp/gui_hidden"
+#define __NR_flock 32
+#define LOCK_SH 1
+#define LOCK_NB 4
+#define LOCK_UN 8
+
+/* duss_hal_display_plane_blending_set config (DispEngine::setBlend layout) */
+typedef struct __attribute__((packed)) {
+    unsigned char enable, glb_alpha_en, pre_blend, pad0;
+    unsigned int  glb_alpha_val;
+    unsigned char alg, order, pad1[2];
+    unsigned int  pos;
+    int hoffset, voffset;
+} gui_blend_t;
+typedef int (*blending_set_fn)(void *disp, signed char plane, void *cfg);
+
+static long sys_flock(int fd, int op) {
+    register long x0 __asm__("x0") = fd;
+    register long x1 __asm__("x1") = op;
+    register long x8 __asm__("x8") = __NR_flock;
+    __asm__ volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
+    return x0;
+}
+
+static int gui_hide_wanted(void) {
+    int fd = (int)sys_openat(AT_FDCWD, GUI_HIDE_PATH, O_RDONLY, 0);
+    if (fd < 0) return 0;
+    int held = sys_flock(fd, LOCK_SH | LOCK_NB) != 0;   /* owner holds LOCK_EX */
+    if (!held) {
+        sys_flock(fd, LOCK_UN);
+        sys_unlinkat(AT_FDCWD, GUI_HIDE_PATH, 0);         /* stale: owner is gone */
+        NTLOG("gui_hide: owner gone, request removed");
+    }
+    sys_close(fd);
+    return held;
+}
+
+static void *gui_hide_thread_fn(void *arg) {
+    (void)arg;
+    struct timespec_t ts = { 0, 20000000 };
+    blending_set_fn bset = 0;
+    int hidden = 0;
+    sys_unlinkat(AT_FDCWD, GUI_HIDDEN_PATH, 0);   /* no ack from a previous instance */
+    while (1) {
+        sys_nanosleep(&ts, 0);
+        int want = gui_hide_wanted();
+        if (want == hidden) continue;
+        int plane = g_gui_plane;
+        void *h = g_gui_handle;
+        if (plane < 0 || !h) continue;               /* GUI hasn't pushed a frame yet */
+        if (!bset && g_dlsym)
+            bset = (blending_set_fn)g_dlsym(RTLD_DEFAULT, "duss_hal_display_plane_blending_set");
+        if (!bset) { NTLOG("gui_hide: no blending_set"); ts.tv_sec = 1; continue; }
+        /* stock GUI blending (/proc/display/plane): per-pixel alpha, gfx0
+         * order 2, gfx1 order 1, no offset. Hidden: global alpha 0. */
+        gui_blend_t b = { 1, (unsigned char)(want ? 1 : 0), 0, 0, want ? 0u : 255u, 0,
+                          (unsigned char)(plane == 6 ? 1 : 2), {0, 0}, 0, 0, 0 };
+        int r = bset(h, (signed char)plane, &b);
+        if (r != 0) { NTLOG_INT("gui_hide: blending_set failed r=", r); continue; }
+        hidden = want;
+        if (hidden) {
+            int fd = (int)sys_openat(AT_FDCWD, GUI_HIDDEN_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd >= 0) sys_close(fd);
+            NTLOG("gui_hide: GUI plane hidden");
+        } else {
+            sys_unlinkat(AT_FDCWD, GUI_HIDDEN_PATH, 0);
+            NTLOG("gui_hide: GUI plane restored");
+        }
+    }
+    return 0;
+}
+
+static void start_gui_hide_thread(void) {
+    pthread_create_fn pcreate = g_dlsym ? (pthread_create_fn)g_dlsym(RTLD_DEFAULT, "pthread_create") : 0;
+    if (!pcreate) return;
+    unsigned long tid;
+    pcreate(&tid, 0, gui_hide_thread_fn, 0);
 }
 
 /* ---- Signal handlers ---- */
@@ -935,5 +1041,6 @@ int natartos_mod_init(void *(*loader_dlsym)(void *, const char *)) {
     NTLOG("init: starting watcher");
     start_watcher_thread();
     start_back_watcher();
+    start_gui_hide_thread();
     return 0;
 }
