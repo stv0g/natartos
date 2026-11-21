@@ -67,6 +67,7 @@ dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb r
 int  dispout_push(dispout_t *o, void *fb);
 void dispout_close(dispout_t *o);
 void dispout_qsync_off(void);
+void dispout_stereo_off(void);
 
 /* headtrack.c — head attitude from the goggles' MCU (100 Hz, no drone).
  * The DJI bus clients run in a forked helper process (isolates DJI's

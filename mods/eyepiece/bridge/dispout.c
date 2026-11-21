@@ -40,7 +40,19 @@ static struct {
     int (*push_frame)(void *disp, int8_t plane, void *fb);
     int (*blending_set)(void *disp, int8_t plane, void *cfg);
     int (*qsync_set)(void *disp, void *cfg);
+    int (*timing_set)(void *disp, void *cfg);
+    int (*crop_set)(void *disp, int8_t plane, void *cfg);
 } D;
+
+/* EXPERIMENTAL stereo (EYEPIECE_STEREO=<timing>, e.g. 1901): one side-by-side frame
+ * (W×H, W = 2 eyes) goes to VOP0 (left eye) and VOP1 (right eye), each VIDEO0 cropped to
+ * its half; VOP0 is switched to the 3D timing like the stock player's DisplaySink
+ * (duss_hal_display_timing_set {res, fmt, bitdepth}) and back to {0,0,0} on close —
+ * DisplaySink::deinit does the same ("Set display to 2D timing before display close"). */
+typedef struct __attribute__((packed)) { uint32_t res, fmt, bitdepth; } disp_timing_t;
+/* test_disp "crop $plane $en $hoff $voff $hsize $vsize" → duss_hal_display_plane_crop_set */
+typedef struct __attribute__((packed)) { uint8_t en, _pad[3]; int32_t hoff, voff, hsize, vsize; } disp_crop_t;
+static void *g_timing_disp;    /* VOP0 while in the 3D timing (crash handler) */
 
 /* duss_hal_display_qsync_set config (test_disp "set_qsync $vfp $enable"):
  * variable refresh — the panel may stretch its vertical front porch up to
@@ -75,8 +87,13 @@ typedef struct __attribute__((packed)) {
 #define PANEL_W 1920
 #define PANEL_H 1080
 
+struct dispout;
+typedef struct { struct dispout *o; int v; } vop_ctx_t;
+
 struct dispout {
     void *dev;
+    vop_ctx_t vctx[MAX_VOP];
+    int stereo;
     void *disp[MAX_VOP];
     int8_t plane[MAX_VOP];
     int nvop;
@@ -84,7 +101,7 @@ struct dispout {
     void *user;
     pthread_mutex_t mu;
     /* per-frame refcount: a frame pushed to N VOPs is free after N pops */
-    struct { void *fb; int refs; uint32_t seq; uint64_t t_push; } held[32];
+    struct { void *fb; int refs; uint32_t seq; uint64_t t_push; uint8_t pend; } held[32];
     uint32_t pushed, popped, errors, reclaimed;
     /* -M metrics: push→latch (frame waited for its refresh) and refresh interval */
     int metrics;
@@ -105,6 +122,8 @@ static int load(void) {
     L(push_frame, "duss_hal_display_push_frame");
     L(blending_set, "duss_hal_display_plane_blending_set");
     *(void **)&D.qsync_set = dlsym(h, "duss_hal_display_qsync_set");   /* optional */
+    *(void **)&D.timing_set = dlsym(h, "duss_hal_display_timing_set");
+    *(void **)&D.crop_set = dlsym(h, "duss_hal_display_plane_crop_set");
 #undef L
     return 0;
 }
@@ -117,14 +136,16 @@ static int load(void) {
  * still held is a drop: reclaim it. Single-VOP only (multi-VOP pops differ). */
 static int on_pop(void *inst, int8_t plane, void *fb, void *user) {
     (void)inst; (void)plane;
-    dispout_t *o = user;
+    vop_ctx_t *vc = user;
+    dispout_t *o = vc->o;
+    uint8_t bit = (uint8_t)(1u << vc->v);
     if (!fb) return 0;
     void *rel[33]; int nrel = 0;
     pthread_mutex_lock(&o->mu);
     o->popped++;
     int me = -1;
-    for (int i = 0; i < 32; i++) if (o->held[i].fb == fb) { me = i; break; }
-    if (me >= 0 && o->metrics) {
+    for (int i = 0; i < 32; i++) if (o->held[i].fb == fb && (o->held[i].pend & bit)) { me = i; break; }
+    if (me >= 0 && o->metrics && vc->v == 0) {
         /* frame `me` leaves the screen at the refresh that latches the next one */
         uint64_t t = now_us();
         uint32_t nseq = o->held[me].seq + 1;
@@ -136,13 +157,15 @@ static int on_pop(void *inst, int8_t plane, void *fb, void *user) {
         o->m_last_pop = t;
     }
     if (me >= 0) {
+        /* per-VOP FIFO: every older frame still pending on this VOP was dropped by it */
         uint32_t seq = o->held[me].seq;
-        if (--o->held[me].refs <= 0) { o->held[me].fb = NULL; rel[nrel++] = fb; }
-        if (o->nvop == 1)
-            for (int i = 0; i < 32; i++)
-                if (o->held[i].fb && (int32_t)(o->held[i].seq - seq) < 0) {
-                    rel[nrel++] = o->held[i].fb; o->held[i].fb = NULL; o->reclaimed++;
-                }
+        for (int i = 0; i < 32; i++) {
+            if (!o->held[i].fb || !(o->held[i].pend & bit)) continue;
+            if (i != me && (int32_t)(o->held[i].seq - seq) >= 0) continue;
+            o->held[i].pend &= (uint8_t)~bit;
+            if (i != me) o->reclaimed++;
+            if (!o->held[i].pend) { rel[nrel++] = o->held[i].fb; o->held[i].fb = NULL; }
+        }
     }
     pthread_mutex_unlock(&o->mu);
     for (int i = 0; i < nrel; i++) o->release(o->user, rel[i]);
@@ -178,8 +201,16 @@ dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb r
     pthread_mutex_init(&o->mu, NULL);
     o->release = release; o->user = user;
     o->metrics = getenv("EYEPIECE_METRICS") != NULL;
+    const char *st = getenv("EYEPIECE_STEREO");
+    int stereo_res = st ? atoi(st) : 0;
+    o->stereo = st != NULL;
+    if (o->stereo) {
+        vop_mask = 3;
+        vlog("dispout: STEREO (experimental): %dx%d side by side → VOP0 left / VOP1 right, "
+             "%d×%d per eye, timing %d", src_w, src_h, src_w / 2, src_h, stereo_res);
+    }
     /* stream smaller than the panel: 1:1, centred (no plane scaler) */
-    int need_center = src_w > 0 && src_h > 0 && src_w <= PANEL_W && src_h <= PANEL_H &&
+    int need_center = !o->stereo && src_w > 0 && src_h > 0 && src_w <= PANEL_W && src_h <= PANEL_H &&
                       (src_w != PANEL_W || src_h != PANEL_H);
     uint32_t zero = 0;
     int r = D.device_open("/dev/dji_display", &zero, &o->dev);
@@ -200,10 +231,16 @@ dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb r
         if (need_center) { b.hoffset = ((PANEL_W - src_w) / 2) & ~1; b.voffset = ((PANEL_H - src_h) / 2) & ~1; }
         if ((r = D.blending_set(disp, plane, &b)) != 0)
             vlog("dispout: blending_set vop %d plane %d: %d", vop, plane, r);
+        if (o->stereo) {
+            disp_crop_t c = { .en = 1, .hoff = vop * (src_w / 2), .voff = 0, .hsize = src_w / 2, .vsize = src_h };
+            r = D.crop_set ? D.crop_set(disp, plane, &c) : -1;
+            vlog("dispout: vop %d crop +%d+0 %dx%d → %d", vop, c.hoff, c.hsize, c.vsize, r);
+        }
         if (need_center)
             vlog("dispout: vop %d: %dx%d stream shown 1:1 centred at +%d+%d", vop, src_w, src_h,
                  b.hoffset, b.voffset);
-        if ((r = D.register_frame_cycle_callback(disp, plane, on_pop, o)) != 0)
+        o->vctx[o->nvop].o = o; o->vctx[o->nvop].v = o->nvop;
+        if ((r = D.register_frame_cycle_callback(disp, plane, on_pop, &o->vctx[o->nvop])) != 0)
             vlog("dispout: frame-cycle callback vop %d: %d (frames will be recycled late)", vop, r);
         const char *q = getenv("EYEPIECE_QSYNC");
         if (q && vop == 0 && D.qsync_set) {
@@ -218,6 +255,12 @@ dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb r
         vlog("dispout: vop %d plane %d acquired", vop, plane);
     }
     if (!o->nvop) { free(o); return NULL; }
+    if (o->stereo && stereo_res && o->nvop == 2 && D.timing_set) {
+        disp_timing_t t = { (uint32_t)stereo_res, 0, 0 };
+        r = D.timing_set(o->disp[0], &t);
+        vlog("dispout: vop 0 timing_set(%d) → %d", stereo_res, r);
+        if (r == 0) g_timing_disp = o->disp[0];
+    }
     return o;
 }
 
@@ -227,6 +270,7 @@ int dispout_push(dispout_t *o, void *fb) {
     int slot = -1;
     for (int i = 0; i < 32; i++) if (!o->held[i].fb) { slot = i; break; }
     if (slot >= 0) { o->held[slot].fb = fb; o->held[slot].refs = o->nvop; o->held[slot].seq = o->pushed;
+                     o->held[slot].pend = (uint8_t)((1u << o->nvop) - 1);
                      o->held[slot].t_push = now_us(); }
     pthread_mutex_unlock(&o->mu);
     if (slot < 0) { o->errors++; return -1; }
@@ -250,6 +294,7 @@ int dispout_push(dispout_t *o, void *fb) {
         if (o->errors++ < 20) vlog("dispout: push_frame vop#%d: %d", i, r);
         pthread_mutex_lock(&o->mu);                  /* this VOP won't pop it */
         o->held[slot].refs--;
+        o->held[slot].pend &= (uint8_t)~(1u << i);
         pthread_mutex_unlock(&o->mu);
     }
     if (!ok) {
@@ -274,9 +319,19 @@ void dispout_qsync_off(void) {
     D.qsync_set(d, &qs);
 }
 
+/* Back to the 2D timing (exit and crash handler; idempotent). */
+void dispout_stereo_off(void) {
+    void *d = g_timing_disp;
+    if (!d || !D.timing_set) return;
+    g_timing_disp = NULL;
+    disp_timing_t t = { 0, 0, 0 };
+    D.timing_set(d, &t);
+}
+
 void dispout_close(dispout_t *o) {
     if (!o) return;
     dispout_qsync_off();
+    if (g_timing_disp) { dispout_stereo_off(); vlog("dispout: vop 0 timing back to 2D"); }
     for (int i = 0; i < o->nvop; i++) {
         D.release_plane(o->disp[i], o->plane[i]);
         D.display_close(o->disp[i]);

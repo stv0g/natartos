@@ -576,6 +576,7 @@ static char g_flag_path[256];
 static void on_crash(int sig) {
     if (g_flag_path[0]) unlink(g_flag_path);
     dispout_qsync_off();          /* best effort: don't leave the panel in VRR mode */
+    dispout_stereo_off();         /* nor in the 3D timing */
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -780,6 +781,7 @@ int main(int argc, char **argv) {
     if (ls >= 0) close(ls);
     if (opt_headtrack) headtrack_stop();
     dispout_qsync_off();                 /* panel back to fixed refresh */
+    dispout_stereo_off();                /* VOP0 back to the 2D timing */
     if (g_gui_hidden) gui_hide_end();    /* overlay shows the GUI plane again */
     else if (opt_video) fbout_close(&g_fb);   /* removes fb_override → overlay restores the UI */
     if (g_log) fclose(g_log);
