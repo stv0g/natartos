@@ -19,6 +19,9 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -194,19 +197,19 @@ static void metrics_report(dispout_t *o) {
     pthread_mutex_unlock(&o->mu);
 }
 
-dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb release, void *user) {
+dispout_t *dispout_open(int vop_mask, int src_w, int src_h, int stereo_res, dispout_release_cb release, void *user) {
     if (load() < 0) return NULL;
     dispout_t *o = calloc(1, sizeof(*o));
     if (!o) return NULL;
     pthread_mutex_init(&o->mu, NULL);
     o->release = release; o->user = user;
     o->metrics = getenv("EYEPIECE_METRICS") != NULL;
-    const char *st = getenv("EYEPIECE_STEREO");
-    int stereo_res = st ? atoi(st) : 0;
-    o->stereo = st != NULL;
+    const char *st = getenv("EYEPIECE_STEREO");   /* experiment override */
+    if (st) stereo_res = atoi(st);
+    o->stereo = st != NULL || stereo_res > 0;
     if (o->stereo) {
         vop_mask = 3;
-        vlog("dispout: STEREO (experimental): %dx%d side by side → VOP0 left / VOP1 right, "
+        vlog("dispout: stereo: %dx%d side by side → VOP0 left / VOP1 right, "
              "%d×%d per eye, timing %d", src_w, src_h, src_w / 2, src_h, stereo_res);
     }
     /* stream smaller than the panel: 1:1, centred (no plane scaler) */
@@ -317,6 +320,35 @@ void dispout_qsync_off(void) {
     g_qsync_disp = NULL;
     disp_qsync_t qs = { .vfp = 16, .enable = 0 };
     D.qsync_set(d, &qs);
+}
+
+/* A bridge killed with SIGKILL in stereo leaves VOP0 in the 3D timing (TESTLOG 114):
+ * at startup, reset it if /proc/display/timing shows the 3D timing on VOP 0. */
+static void reset_3d_child(void) {
+    if (hwdec_hal_init() < 0 || load() < 0 || !D.timing_set) _exit(2);
+    void *dev = NULL, *disp = NULL; uint32_t zero = 0;
+    if (D.device_open("/dev/dji_display", &zero, &dev) != 0) _exit(3);
+    if (D.display_open(dev, &disp, 0) != 0) _exit(4);
+    disp_timing_t t = { 0, 0, 0 };
+    _exit(D.timing_set(disp, &t) == 0 ? 0 : 5);   /* _exit: no DJI destructors */
+}
+
+void dispout_reset_stale_3d(void) {
+    FILE *f = fopen("/proc/display/timing", "r");
+    if (!f) return;
+    char l[256]; int stale = 0;
+    while (fgets(l, sizeof(l), f))
+        if (!strncmp(l, "VOP 0:", 6)) { stale = strstr(l, " 1901 ") != NULL; break; }
+    fclose(f);
+    if (!stale) return;
+    /* in a child: the duss HAL starts threads, and the bridge forks its head-tracking
+     * helper later, which must happen before any thread exists */
+    pid_t p = fork();
+    if (p == 0) reset_3d_child();
+    int st = -1;
+    if (p > 0) waitpid(p, &st, 0);
+    vlog("dispout: VOP0 was left in the 3D timing (killed stereo session) → 2D: %s (%d)",
+         p > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "ok" : "failed", st);
 }
 
 /* Back to the 2D timing (exit and crash handler; idempotent). */

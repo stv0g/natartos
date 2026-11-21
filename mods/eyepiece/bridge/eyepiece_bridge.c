@@ -43,7 +43,7 @@ static int  opt_hw = 1, opt_hw_frames = 12, opt_hw_sync = -1;   /* -D, -F, -S */
 static int  opt_rndis = 0;   /* -U rndis: USB network to the PC (eyepiece-pc deploy asks for it) */
 static int  g_rndis;
 static int  opt_direct = 1;  /* -O VOP mask (VOP0 drives both eyes via DSI2DSI), 0 = fb */
-static hwdec_tune_t opt_hw_tune = { 1, 0, 0, 0 };                 /* -L, -O */
+static hwdec_tune_t opt_hw_tune = { 1, 0, 0, 0, 0 };                 /* -L, -O */
 static int opt_gui_transparent = 1;                               /* -T clears it */
 static const char *opt_log = NULL;   /* default: tmp_path("eyepiece.log") */
 
@@ -308,7 +308,7 @@ static void *decode_thread(void *arg) {
     swdec_t *dec[2] = { NULL, NULL };
     int failed[2] = { 0, 0 };
     hwdec_t *hw = NULL;
-    ep_stream_t hw_cfg = { 0, 0, 0, 0, 0 };
+    ep_stream_t hw_cfg = { 0, 0, 0, 0, 0, 0 };
     int hw_failed = 0;
     while (!g_exit) {
         pthread_mutex_lock(&g_q_mu);
@@ -331,7 +331,19 @@ static void *decode_thread(void *arg) {
             pthread_mutex_unlock(&g_q_mu);
             if (!st.width) { st.width = (uint16_t)opt_fb_w; st.height = (uint16_t)opt_fb_h; }
             st.codec = a.codec;
-            if (hw && (st.width != hw_cfg.width || st.height != hw_cfg.height || st.codec != hw_cfg.codec)) {
+            if (st.layout == EP_LAYOUT_SBS && (st.width != 2 * EP_SBS_EYE_W || st.height != EP_SBS_EYE_H)) {
+                vlog("stereo stream %ux%u refused: side by side must be %ux%u (%ux%u per eye, no "
+                     "display scaler)", st.width, st.height, 2 * EP_SBS_EYE_W, EP_SBS_EYE_H,
+                     EP_SBS_EYE_W, EP_SBS_EYE_H);
+                pthread_mutex_lock(&g_tx_mu);
+                if (g_cfd >= 0) shutdown(g_cfd, SHUT_RDWR);
+                pthread_mutex_unlock(&g_tx_mu);
+                pthread_mutex_lock(&g_q_mu); q_clear_locked(); g_need_key = 1; pthread_mutex_unlock(&g_q_mu);
+                free(a.buf);
+                continue;
+            }
+            if (hw && (st.width != hw_cfg.width || st.height != hw_cfg.height || st.codec != hw_cfg.codec ||
+                       st.layout != hw_cfg.layout)) {
                 /* Reopening the VC8000D in the same process crashes in DJI's
                  * decoder/ION teardown (coredumps), and the display has no
                  * scaler, so a smaller stream would only be a small picture in
@@ -348,6 +360,7 @@ static void *decode_thread(void *arg) {
             }
             if (!hw) {
                 if (!a.key) { free(a.buf); continue; }      /* (re)start on an IDR */
+                opt_hw_tune.stereo = st.layout == EP_LAYOUT_SBS && opt_hw_tune.direct_vops ? 1901 : 0;
                 hw = hwdec_open(st.codec, st.width, st.height, opt_hw_frames, opt_hw_sync,
                                 &opt_hw_tune, hw_frame, NULL);
                 hw_cfg = st;
@@ -488,7 +501,8 @@ static void serve_client(int fd) {
     pthread_mutex_unlock(&g_q_mu);
 
     ep_info_t info = { EP_VERSION, (uint16_t)opt_fb_w, (uint16_t)opt_fb_h,
-                       (uint8_t)(opt_video ? (opt_hw ? 2 : 1) : 0), g_ht_flags, 0 };
+                       (uint8_t)(opt_video ? (opt_hw ? 2 : 1) : 0), g_ht_flags,
+                       (uint8_t)(opt_video && opt_hw_tune.direct_vops ? EP_INFO_STEREO : 0), 0 };
     tx(EP_INFO, &info, sizeof(info));
     vlog("client connected");
 
@@ -731,6 +745,7 @@ int main(int argc, char **argv) {
     signal(SIGILL, on_crash);
 
     vlog("eyepiece_bridge v%d starting (port %d, fb %dx%d)", EP_VERSION, opt_port, opt_fb_w, opt_fb_h);
+    if (opt_video && opt_hw_tune.direct_vops) dispout_reset_stale_3d();
 
     if (opt_video && opt_hw_tune.direct_vops) {
         if (gui_hide_begin() == 0) {
@@ -755,7 +770,10 @@ int main(int argc, char **argv) {
     pthread_t th;
     pthread_create(&th, NULL, pose_thread, NULL); pthread_detach(th);
     if (opt_video) { pthread_create(&th, NULL, decode_thread, NULL); pthread_detach(th); }
-    show_waiting();
+    /* a session bridge (-1, started by the PC) skips the waiting screen when it would
+     * open the decoder (IDR on VIDEO0): the PC connects within a second, and a stereo
+     * stream needs the decoder opened at its own size (no reopen in one process) */
+    if (!(opt_once && g_gui_hidden)) show_waiting();
     if (opt_back)  { pthread_create(&th, NULL, back_thread, NULL); pthread_detach(th); }
 
     /* before listening: the switch drops adb for a few seconds (the PC waits for
