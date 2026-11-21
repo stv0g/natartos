@@ -13,6 +13,12 @@
  * switch is done once and then kept (no switch back on exit): a bridge that is killed
  * can't leave the USB half-configured, and later sessions don't re-enumerate USB.
  *
+ * Windows: the stock rndis.0 has no Microsoft OS descriptor, so Windows would not load its
+ * inbox RNDIS driver. The switch sets one (compatible ID "RNDIS", sub-ID "5162001", vendor
+ * code 0xcd, "MSFT100") and a distinct bcdDevice: Windows caches "this device has no OS
+ * descriptor" per VID/PID/bcdDevice, and the stock acm+adb mode was enumerated without one.
+ * Linux and macOS ignore the descriptor (macOS has no RNDIS driver at all).
+ *
  * rndis0 already carries 192.168.60.2/24 (stock). A DHCP server (busybox udhcpd) hands
  * the PC 192.168.60.1 — one lease, no router and no DNS option, so the PC's default
  * route and name resolution stay untouched.
@@ -36,6 +42,9 @@
 #define DHCP_PID  DIR_TMP "/udhcpd.pid"
 #define RNDIS_HOST_MAC "02:65:79:65:00:01"   /* PC side, "eye" */
 #define RNDIS_DEV_MAC  "02:65:79:65:00:02"   /* goggles side */
+#define RNDIS_BCD      "0x6570"              /* bcdDevice in rndis mode (stock 0x0504) */
+#define OSD            GADGET "/os_desc"
+#define OSD_RNDIS      GADGET "/functions/rndis.0/os_desc/interface.rndis"
 
 static int read_file(const char *p, char *buf, size_t n) {
     int fd = open(p, O_RDONLY | O_CLOEXEC);
@@ -100,9 +109,27 @@ static int link_funcs(const char *const *funcs, int n) {
 }
 
 static int rndis_active(void) {
-    char f[9][32];
+    char f[9][32], use[8] = "";
     int n = read_links(f);
-    return n == 2 && !strcmp(f[0], "rndis.0") && !strcmp(f[1], "ffs.adb");
+    read_file(OSD "/use", use, sizeof(use));
+    /* an older bridge switched without the OS descriptor → switch again once */
+    return n == 2 && !strcmp(f[0], "rndis.0") && !strcmp(f[1], "ffs.adb") && !strcmp(use, "1");
+}
+
+/* Microsoft OS descriptor for the Windows inbox RNDIS driver (gadget must be unbound) */
+static void set_os_desc(int on) {
+    unlink(OSD "/c.1");
+    if (on) {
+        write_file(OSD_RNDIS "/compatible_id", "RNDIS");
+        write_file(OSD_RNDIS "/sub_compatible_id", "5162001");
+        write_file(OSD "/b_vendor_code", "0xcd");
+        write_file(OSD "/qw_sign", "MSFT100");
+        write_file(OSD "/use", "1");
+        if (symlink(CFG, OSD "/c.1") < 0) vlog("rndis: os_desc link: %s", strerror(errno));
+        write_file(GADGET "/bcdDevice", RNDIS_BCD);
+    } else {
+        write_file(OSD "/use", "0");
+    }
 }
 
 static int switch_gadget(void) {
@@ -111,8 +138,9 @@ static int switch_gadget(void) {
         vlog("rndis: gadget not bound (UDC empty) — leaving USB alone");
         return -1;
     }
-    char old[9][32];
+    char old[9][32], oldbcd[16] = "";
     int nold = read_links(old);
+    read_file(GADGET "/bcdDevice", oldbcd, sizeof(oldbcd));
     const char *oldp[9];
     for (int i = 0; i < nold; i++) oldp[i] = old[i];
     vlog("rndis: switching USB %s%s%s → rndis.0 + ffs.adb (UDC %s; adb drops for a few seconds)",
@@ -126,6 +154,7 @@ static int switch_gadget(void) {
     write_file(GADGET "/functions/rndis.0/host_addr", RNDIS_HOST_MAC);
     write_file(GADGET "/functions/rndis.0/dev_addr", RNDIS_DEV_MAC);
     unlink_all();
+    set_os_desc(1);
     static const char *const want[] = { "rndis.0", "ffs.adb" };
     e = link_funcs(want, 2);
     if (!e) e = write_file(GADGET "/UDC", udc);
@@ -134,6 +163,8 @@ static int switch_gadget(void) {
     vlog("rndis: bind failed (%s) → restoring the previous USB config", strerror(-e));
     write_file(GADGET "/UDC", "\n");
     unlink_all();
+    set_os_desc(0);
+    if (oldbcd[0]) write_file(GADGET "/bcdDevice", oldbcd);
     link_funcs(oldp, nold);
     e = write_file(GADGET "/UDC", udc);
     vlog("rndis: previous USB config %s", e ? "NOT restored (power-cycle restores stock)" : "restored");
