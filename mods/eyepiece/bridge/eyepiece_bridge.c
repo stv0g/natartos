@@ -40,7 +40,7 @@ static int  opt_any_addr = 0, opt_null_dec = 0;
 /* default: VC8000D + zero-copy scan-out on both eyes (measured on device: 60 fps,
  * decode 2.7 ms); falls back to software decode if it fails to open.     */
 static int  opt_hw = 1, opt_hw_frames = 12, opt_hw_sync = -1;   /* -D, -F, -S */
-static int  opt_rndis = 1;   /* -U adb: keep the USB config (no RNDIS network to the PC) */
+static int  opt_rndis = 0;   /* -U rndis: USB network to the PC (eyepiece-pc deploy asks for it) */
 static int  g_rndis;
 static int  opt_direct = 1;  /* -O VOP mask (VOP0 drives both eyes via DSI2DSI), 0 = fb */
 static hwdec_tune_t opt_hw_tune = { 1, 0, 0, 0 };                 /* -L, -O */
@@ -588,8 +588,9 @@ static void usage(const char *a0) {
         "usage: %s [options]\n"
         "  -p PORT     TCP port on 127.0.0.1 (default %d; PC: adb forward tcp:%d tcp:%d)\n"
         "  -A          listen on all interfaces (e.g. Wi-Fi) instead of loopback (+ RNDIS)\n"
-        "  -U adb|rndis  USB link to the PC: rndis (default) = switch USB once to RNDIS + adb\n"
-        "              and serve DHCP (lower latency than adb forward); adb = leave USB as is\n"
+        "  -U adb|rndis  USB link to the PC: adb (default) = leave USB as is; rndis = switch USB\n"
+        "              once per boot to RNDIS + adb and serve DHCP (lower latency than adb\n"
+        "              forward; re-enumerates USB, so not while a WebUSB page holds the device)\n"
         "  -s WxH      output framebuffer size (default 1920x1080)\n"
         "  -t N        decoder slice threads (default 4)\n"
         "  -c N        colour-convert threads (default 4)\n"
@@ -682,7 +683,7 @@ int main(int argc, char **argv) {
                          &opt_hw_tune.val2c); break;
         case 'l': opt_log = optarg; break;
         case 'Z': opt_mcu_stop = 1; break;   /* only send the MCU attitude stop */
-        case 'U': opt_rndis = strcmp(optarg, "adb") != 0; break;
+        case 'U': opt_rndis = !strcmp(optarg, "rndis"); break;
         default: usage(argv[0]); return 2;
         }
     }
