@@ -10,7 +10,7 @@
 # ~/Android/Sdk/ndk/*. Exits with status 3 when no NDK is found.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRCS="eyepiece_bridge.c swdec.c hwdec.c dispout.c yuv2fb.c fbout.c fbtext.c headtrack.c"
+SRCS="eyepiece_bridge.c swdec.c hwdec.c dispout.c yuv2fb.c fbout.c fbtext.c headtrack.c rndis.c"
 CFLAGS="-O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11"
 
 MODE=ndk

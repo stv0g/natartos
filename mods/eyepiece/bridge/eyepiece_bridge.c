@@ -40,6 +40,8 @@ static int  opt_any_addr = 0, opt_null_dec = 0;
 /* default: VC8000D + zero-copy scan-out on both eyes (measured on device: 60 fps,
  * decode 2.7 ms); falls back to software decode if it fails to open.     */
 static int  opt_hw = 1, opt_hw_frames = 12, opt_hw_sync = -1;   /* -D, -F, -S */
+static int  opt_rndis = 1;   /* -U adb: keep the USB config (no RNDIS network to the PC) */
+static int  g_rndis;
 static int  opt_direct = 1;  /* -O VOP mask (VOP0 drives both eyes via DSI2DSI), 0 = fb */
 static hwdec_tune_t opt_hw_tune = { 1, 0, 0, 0 };                 /* -L, -O */
 static int opt_gui_transparent = 1;                               /* -T clears it */
@@ -584,7 +586,9 @@ static void usage(const char *a0) {
     fprintf(stderr,
         "usage: %s [options]\n"
         "  -p PORT     TCP port on 127.0.0.1 (default %d; PC: adb forward tcp:%d tcp:%d)\n"
-        "  -A          listen on all interfaces (e.g. RNDIS/Wi-Fi) instead of loopback\n"
+        "  -A          listen on all interfaces (e.g. Wi-Fi) instead of loopback (+ RNDIS)\n"
+        "  -U adb|rndis  USB link to the PC: rndis (default) = switch USB once to RNDIS + adb\n"
+        "              and serve DHCP (lower latency than adb forward); adb = leave USB as is\n"
         "  -s WxH      output framebuffer size (default 1920x1080)\n"
         "  -t N        decoder slice threads (default 4)\n"
         "  -c N        colour-convert threads (default 4)\n"
@@ -646,7 +650,7 @@ static int take_over(void) {
 
 int main(int argc, char **argv) {
     int o;
-    while ((o = getopt(argc, argv, "p:As:t:c:fVHb1ND:F:S:L:O:TMQ:l:Zh")) != -1) {
+    while ((o = getopt(argc, argv, "p:As:t:c:fVHb1ND:F:S:L:O:TMQ:l:ZhU:")) != -1) {
         switch (o) {
         case 'p': opt_port = atoi(optarg); break;
         case 'A': opt_any_addr = 1; break;
@@ -677,6 +681,7 @@ int main(int argc, char **argv) {
                          &opt_hw_tune.val2c); break;
         case 'l': opt_log = optarg; break;
         case 'Z': opt_mcu_stop = 1; break;   /* only send the MCU attitude stop */
+        case 'U': opt_rndis = strcmp(optarg, "adb") != 0; break;
         default: usage(argv[0]); return 2;
         }
     }
@@ -751,16 +756,20 @@ int main(int argc, char **argv) {
     show_waiting();
     if (opt_back)  { pthread_create(&th, NULL, back_thread, NULL); pthread_detach(th); }
 
+    /* before listening: the switch drops adb for a few seconds (the PC waits for
+     * "listening on" in the log) */
+    if (opt_rndis) g_rndis = rndis_setup() == 0;
     int ls = g_ls = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons((uint16_t)opt_port) };
-    addr.sin_addr.s_addr = htonl(opt_any_addr ? INADDR_ANY : INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(opt_any_addr || g_rndis ? INADDR_ANY : INADDR_LOOPBACK);
     if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(ls, 1) < 0) {
         vlog("bind/listen :%d failed: %s", opt_port, strerror(errno));
         g_exit = 1;
     } else {
-        vlog("listening on %s:%d", opt_any_addr ? "0.0.0.0" : "127.0.0.1", opt_port);
+        vlog("listening on %s:%d", opt_any_addr ? "0.0.0.0" : g_rndis ? "127.0.0.1 + " RNDIS_ADDR : "127.0.0.1",
+             opt_port);
     }
 
     while (!g_exit) {
@@ -769,6 +778,17 @@ int main(int argc, char **argv) {
             if (errno == EINTR) continue;
             if (!g_exit) vlog("accept: %s", strerror(errno));
             break;
+        }
+        if (g_rndis && !opt_any_addr) {
+            /* bound to 0.0.0.0 for RNDIS: accept only loopback (adb forward) and the
+             * RNDIS address, never Wi-Fi */
+            struct sockaddr_in la; socklen_t ll = sizeof(la);
+            if (getsockname(fd, (struct sockaddr *)&la, &ll) == 0 &&
+                la.sin_addr.s_addr != htonl(INADDR_LOOPBACK) &&
+                la.sin_addr.s_addr != inet_addr(RNDIS_ADDR)) {
+                close(fd);
+                continue;
+            }
         }
         serve_client(fd);
         if (opt_once) break;
