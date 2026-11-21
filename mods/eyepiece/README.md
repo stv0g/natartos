@@ -75,9 +75,11 @@ Protocol version 1.
 - Recovery: if the stream is ever left running, run
   `/vendor/natartos/apps/eyepiece/eyepiece_bridge -Z`. It sends only the stop
   and exits.
-- At runtime the bridge writes only `/data/local/tmp/{fb_shared,fb_override,eyepiece.log}`.
-  It never writes `/system`, `/vendor` or any partition. If it crashes, it
-  removes `fb_override` so the stock UI comes back.
+- At runtime the bridge writes only `/data/local/tmp/{fb_gui_hide,eyepiece.lock,eyepiece.log}`
+  (with an overlay that predates `fb_gui_hide`: `fb_shared` and `fb_override` instead).
+  It never writes `/system`, `/vendor` or any partition. While it holds a lock on
+  `fb_gui_hide` the overlay hides the GUI plane; if the bridge crashes, the lock is
+  released and the overlay shows the stock UI again.
 - SELinux must be permissive, as set by the toolya root session. The bridge
   has not been tested with SELinux enforcing.
 

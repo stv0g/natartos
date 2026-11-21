@@ -387,38 +387,38 @@ static void *decode_thread(void *arg) {
  * Video goes to the VIDEO0 plane, which lies below the GUI plane. The natartos
  * overlay (inside dji_glasses, the only process allowed to change the GUI
  * plane) sets the GUI plane to global alpha 0 while we hold flock(LOCK_EX) on
- * gui_hide, and acknowledges with gui_hidden. The GUI's buffers are never
+ * fb_gui_hide, and acknowledges with fb_gui_hidden. The GUI's buffers are never
  * touched and it keeps rendering, so nothing has to be restored or repainted
  * on exit; if we die, the kernel drops the lock and the overlay restores the
  * GUI by itself. The waiting screen is a pre-encoded IDR (gen_waiting.sh)
  * decoded onto VIDEO0 like a PC frame.
- * Overlays without gui_hide don't acknowledge → the fb_shared path below
+ * Overlays without fb_gui_hide don't acknowledge → the fb_shared path below
  * (GUI made transparent by painting into its buffers through the overlay).  */
 static int g_hide_fd = -1;
 static int g_gui_hidden;
 
 static int gui_hide_begin(void) {
-    int fd = open(tmp_path("gui_hide"), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    int fd = open(tmp_path("fb_gui_hide"), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
     if (fd < 0) return -1;
     if (flock(fd, LOCK_EX) < 0) { close(fd); return -1; }
     char b[16];
     int n = snprintf(b, sizeof(b), "%d\n", (int)getpid());
     if (ftruncate(fd, 0) == 0) (void)!pwrite(fd, b, (size_t)n, 0);
     for (int i = 0; i < 50; i++) {                       /* overlay polls every 20 ms */
-        if (access(tmp_path("gui_hidden"), F_OK) == 0) { g_hide_fd = fd; return 0; }
+        if (access(tmp_path("fb_gui_hidden"), F_OK) == 0) { g_hide_fd = fd; return 0; }
         usleep(20000);
     }
-    unlink(tmp_path("gui_hide"));
+    unlink(tmp_path("fb_gui_hide"));
     close(fd);
     return -1;
 }
 
 static void gui_hide_end(void) {
     if (g_hide_fd < 0) return;
-    unlink(tmp_path("gui_hide"));
+    unlink(tmp_path("fb_gui_hide"));
     close(g_hide_fd);
     g_hide_fd = -1;
-    for (int i = 0; i < 25 && access(tmp_path("gui_hidden"), F_OK) == 0; i++) usleep(20000);
+    for (int i = 0; i < 25 && access(tmp_path("fb_gui_hidden"), F_OK) == 0; i++) usleep(20000);
 }
 
 /* ---- on-screen status ----------------------------------------------------- */
@@ -728,10 +728,10 @@ int main(int argc, char **argv) {
     if (opt_video && opt_hw_tune.direct_vops) {
         if (gui_hide_begin() == 0) {
             g_gui_hidden = 1;
-            snprintf(g_flag_path, sizeof(g_flag_path), "%s", tmp_path("gui_hide"));
+            snprintf(g_flag_path, sizeof(g_flag_path), "%s", tmp_path("fb_gui_hide"));
             vlog("GUI plane hidden by the overlay; waiting screen on VIDEO0");
         } else {
-            vlog("overlay has no gui_hide → GUI made transparent through fb_shared");
+            vlog("overlay has no fb_gui_hide → GUI made transparent through fb_shared");
         }
     }
     if (opt_video && !g_gui_hidden && fbout_open(&g_fb, opt_fb_w, opt_fb_h) < 0) {

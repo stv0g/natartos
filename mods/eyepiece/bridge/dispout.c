@@ -14,7 +14,7 @@
  *
  * The GUI planes (GRAPH0/1) sit above VIDEO0 (the driver allows orders 0..2 only, so
  * VIDEO0 can't go on top, and only a plane's owner may change its blending): the
- * natartos overlay hides the GUI plane for us (gui_hide in eyepiece_bridge.c).
+ * natartos overlay hides the GUI plane for us (fb_gui_hide in eyepiece_bridge.c).
  */
 #include <dlfcn.h>
 #include <pthread.h>

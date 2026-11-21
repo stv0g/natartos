@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /*
- * mod_eyepiece.so — natartos side of Eyepiece (the goggles as a USB PC
+ * mod_zuim_eyepiece.so — natartos side of Eyepiece (the goggles as a USB PC
  * display with head tracking).
  *
  * Adds the "Eyepiece" entry to the More menu; it launches
@@ -18,7 +18,7 @@ int natartos_mod_register(void *(*loader_dlsym)(void *, const char *)) {
         (natartos_menu_register_fn)loader_dlsym(RTLD_DEFAULT, "natartos_menu_register");
     if (!reg) { NTLOG("menu_register not found"); return 0; }
     natartos_menu_entry e = {
-        .id        = "eyepiece",
+        .id        = "zuim_eyepiece",
         .name      = "Eyepiece",
         .subtitle  = "PC display + head tracking over USB",
         .icon_path = "/vendor/natartos/icons/natartos_icon_stream.rgba",
@@ -26,6 +26,6 @@ int natartos_mod_register(void *(*loader_dlsym)(void *, const char *)) {
         .priority  = 210,
     };
     reg(&e);
-    NTLOG("mod_eyepiece: menu entry registered");
+    NTLOG("mod_zuim_eyepiece: menu entry registered");
     return 1;
 }

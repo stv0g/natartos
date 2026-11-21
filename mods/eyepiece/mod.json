@@ -1,9 +1,9 @@
 {
-  "id": "eyepiece",
+  "id": "zuim_eyepiece",
   "name": "Eyepiece",
   "version": "0.1",
   "type": "app",
-  "so": "mod_eyepiece.so",
+  "so": "mod_zuim_eyepiece.so",
   "source": "mod.c",
   "menu": {
     "label": "Eyepiece",
