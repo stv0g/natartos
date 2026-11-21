@@ -41,7 +41,10 @@ enum {
 #define EP_FLAG_KEY 0x01
 
 enum { EP_CODEC_H264 = 0, EP_CODEC_HEVC = 1 };
-enum { EP_OP_RECENTER = 1, EP_OP_QUIT = 2 };
+enum { EP_OP_RECENTER = 1, EP_OP_QUIT = 2,
+       EP_OP_HEADTRACK = 3 };   /* + u8 on: start/stop the MCU attitude stream (EP_POSE).
+                                   Off until the PC asks; off again on disconnect.
+                                   Bridges without it ignore the op and stream always. */
 
 typedef struct __attribute__((packed)) {
     uint64_t pts_us;   /* PC capture time (PC monotonic clock)                  */

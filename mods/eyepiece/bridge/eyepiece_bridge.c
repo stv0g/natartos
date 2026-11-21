@@ -534,6 +534,10 @@ static void serve_client(int fd) {
             if (h.len >= 1 && p[0] == EP_OP_RECENTER) {
                 pthread_mutex_lock(&g_pose_mu); g_recenter = 1; pthread_mutex_unlock(&g_pose_mu);
                 vlog("recenter requested");
+            } else if (h.len >= 2 && p[0] == EP_OP_HEADTRACK) {
+                vlog("head tracking %s requested", p[1] ? "on" : "off");
+                if (p[1]) { pthread_mutex_lock(&g_pose_mu); g_recenter = 1; pthread_mutex_unlock(&g_pose_mu); }
+                if (opt_headtrack) headtrack_enable(p[1] != 0);
             } else if (h.len >= 1 && p[0] == EP_OP_QUIT) {
                 vlog("quit requested by PC");
                 g_exit = 1;
@@ -555,6 +559,7 @@ static void serve_client(int fd) {
     g_cfd = -1;
     pthread_mutex_unlock(&g_tx_mu);
     close(fd);
+    if (opt_headtrack) headtrack_enable(0);   /* only while a PC asks for it */
     pthread_mutex_lock(&g_q_mu);
     q_clear_locked();
     pthread_mutex_unlock(&g_q_mu);

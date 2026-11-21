@@ -72,7 +72,8 @@ void dispout_qsync_off(void);
  * The DJI bus clients run in a forked helper process (isolates DJI's
  * framework init + signal handlers from the HAL used by hwdec).          */
 typedef void (*pose_cb_t)(float yaw, float pitch, float roll);   /* degrees */
-int  headtrack_spawn(pose_cb_t cb);
+int  headtrack_spawn(pose_cb_t cb);       /* helper ready, MCU stream still off */
+void headtrack_enable(int on);             /* start/stop the MCU stream (idempotent) */
 void headtrack_stop(void);
 /* eyepiece_bridge -Z: send only the MCU attitude stop (recovery / stopper). */
 int  headtrack_mcu_stop_only(void);

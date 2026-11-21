@@ -20,10 +20,14 @@
  * these two fixed payloads is ever sent to imu:2.
  *
  * The bus clients live in a forked helper process so DJI's framework init and
- * signal handlers stay out of the decoder/display process.
+ * signal handlers stay out of the decoder/display process. The helper is
+ * forked at startup (before the bridge has threads) but sends the MCU start
+ * only when the PC asks for head tracking (headtrack_enable → control pipe),
+ * and the stop when it no longer does.
  */
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -43,6 +47,7 @@ static volatile uint64_t g_last_mcu_us;
 static volatile uint32_t g_mcu_count, g_mcu_bad;
 static pose_cb_t g_cb;
 static int g_mcu_started;       /* we sent a successful start → we owe a stop */
+static int g_mcu_wanted;        /* the PC asked for head tracking            */
 
 static int load_duss(void) {
     void *h = dlopen("libduml_frwk.so", RTLD_NOW | RTLD_GLOBAL);
@@ -199,7 +204,7 @@ static int headtrack_bus_start(pose_cb_t cb) {
     desc.req_cb = on_mcu_attitude;
     int r = api.event_register_dynamic_command_with_user_data(g_client_mp, 0x15, 0x32, &desc);
     if (r != 0) { vlog("headtrack: register 0x15/0x32: %d", r); return -1; }
-    mcu_try_start();
+    vlog("headtrack: ready, MCU stream off until the PC asks");
     return 0;
 }
 
@@ -208,6 +213,7 @@ static void headtrack_bus_tick(void) {
     static uint64_t last_try, last_log;
     static uint32_t last_count;
     uint64_t t = now_us();
+    if (!g_mcu_wanted) return;
     if (t - g_last_mcu_us > 1000000 && t - last_try > 3000000) {
         /* stream silent: retry.  Normal once at startup — the first start
          * is ACKed, but packets only reach a freshly created test:3 client
@@ -245,6 +251,7 @@ typedef struct __attribute__((packed)) {
 } pose_rec_t;
 
 static int g_pipe_w = -1;
+static int g_ctl_w = -1;         /* parent → helper: '1' start, '0' stop */
 static volatile sig_atomic_t g_child_exit;
 static pid_t g_child;
 static pose_cb_t g_parent_cb;
@@ -256,7 +263,14 @@ static void child_on_pose(float yaw, float pitch, float roll) {
 
 static void child_sig(int sig) { (void)sig; g_child_exit = 1; }
 
-static void child_main(int wfd) {
+static void child_set_wanted(int on) {
+    if (on == g_mcu_wanted) return;
+    g_mcu_wanted = on;
+    if (on) mcu_try_start();
+    else if (g_mcu_started) { mcu_attitude_cmd(0); g_mcu_started = 0; }
+}
+
+static void child_main(int wfd, int ctl_r) {
     g_pipe_w = wfd;
     prctl(PR_SET_PDEATHSIG, SIGTERM);              /* die with the bridge */
     signal(SIGPIPE, SIG_IGN);
@@ -271,7 +285,12 @@ static void child_main(int wfd) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
+    fcntl(ctl_r, F_SETFL, O_NONBLOCK);
     while (!g_child_exit && getppid() != 1) {
+        char c;
+        ssize_t n;
+        while ((n = read(ctl_r, &c, 1)) == 1) child_set_wanted(c == '1');
+        if (n == 0) break;                         /* parent closed the pipe */
         headtrack_bus_tick();
         usleep(100000);
     }
@@ -327,18 +346,28 @@ static void *reader_thread(void *arg) {
 
 int headtrack_spawn(pose_cb_t cb) {
     g_parent_cb = cb;
-    int p[2];
+    int p[2], c[2];
     if (pipe(p) < 0) return -1;
+    if (pipe(c) < 0) { close(p[0]); close(p[1]); return -1; }
     pid_t pid = fork();
-    if (pid < 0) { close(p[0]); close(p[1]); return -1; }
-    if (pid == 0) { close(p[0]); child_main(p[1]); }
+    if (pid < 0) { close(p[0]); close(p[1]); close(c[0]); close(c[1]); return -1; }
+    if (pid == 0) { close(p[0]); close(c[1]); child_main(p[1], c[0]); }
     close(p[1]);
+    close(c[0]);
+    g_ctl_w = c[1];
+    fcntl(g_ctl_w, F_SETFD, FD_CLOEXEC);
     g_child = pid;
     pthread_t t;
     pthread_create(&t, NULL, reader_thread, (void *)(long)p[0]);
     pthread_detach(t);
     vlog("headtrack: bus helper pid %d", (int)pid);
     return 0;
+}
+
+void headtrack_enable(int on) {
+    if (g_ctl_w < 0) return;
+    char ch = on ? '1' : '0';
+    if (write(g_ctl_w, &ch, 1) != 1) vlog("headtrack: control pipe: %s", strerror(errno));
 }
 
 void headtrack_stop(void) {
