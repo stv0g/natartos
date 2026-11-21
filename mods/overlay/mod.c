@@ -471,7 +471,7 @@ static void *volatile g_pending_buf[PENDING_SLOTS];
 static void start_inject_thread(void);
 
 /* GUI display handle and plane, from the GUI's own push_frame calls (for the
- * gui_hide blending switch below). */
+ * fb_gui_hide blending switch below). */
 static void *volatile g_gui_handle;
 static volatile int g_gui_plane = -1;
 
@@ -855,7 +855,7 @@ int duss_hal_display_push_frame(void *display_handle, int plane_id, void *frame_
     if (plane_id >= 0 && plane_id < 8 && g_gui_plane < 0) {
         g_gui_handle = display_handle;
         g_gui_plane = plane_id;
-        NTLOG_INT("gui_hide: GUI plane=", plane_id);
+        NTLOG_INT("fb_gui_hide: GUI plane=", plane_id);
     }
 
     /* While injecting, the inject thread paints the scanout dmabufs directly;
@@ -877,7 +877,7 @@ int duss_hal_display_push_frame(void *display_handle, int plane_id, void *frame_
     return 0;
 }
 
-/* ---- gui_hide: hide the GUI plane at the display, buffers untouched ----
+/* ---- fb_gui_hide: hide the GUI plane at the display, buffers untouched ----
  *
  * For apps that show their picture on their own display plane (eyepiece:
  * VIDEO0 below the GUI). Painting app frames into the GUI's scanout buffers
@@ -887,14 +887,14 @@ int duss_hal_display_push_frame(void *display_handle, int plane_id, void *frame_
  * global alpha 0 while the app runs: the GUI keeps rendering normally (its
  * frames are not swallowed), so its picture is current when it comes back.
  *
- * Protocol: the app creates /data/local/tmp/gui_hide and holds flock(LOCK_EX)
+ * Protocol: the app creates /data/local/tmp/fb_gui_hide and holds flock(LOCK_EX)
  * on it for as long as the GUI should stay hidden. The overlay acknowledges
- * with /data/local/tmp/gui_hidden. File removed, or lock free (the app died:
+ * with /data/local/tmp/fb_gui_hidden. File removed, or lock free (the app died:
  * the kernel drops the lock) → stock blending restored, ack removed. Polled
  * every 20 ms. The blending must be set from this process: the display
  * driver only lets the plane's owner change it.                          */
-#define GUI_HIDE_PATH   "/data/local/tmp/gui_hide"
-#define GUI_HIDDEN_PATH "/data/local/tmp/gui_hidden"
+#define GUI_HIDE_PATH   "/data/local/tmp/fb_gui_hide"
+#define GUI_HIDDEN_PATH "/data/local/tmp/fb_gui_hidden"
 #define __NR_flock 32
 #define LOCK_SH 1
 #define LOCK_NB 4
@@ -925,7 +925,7 @@ static int gui_hide_wanted(void) {
     if (!held) {
         sys_flock(fd, LOCK_UN);
         sys_unlinkat(AT_FDCWD, GUI_HIDE_PATH, 0);         /* stale: owner is gone */
-        NTLOG("gui_hide: owner gone, request removed");
+        NTLOG("fb_gui_hide: owner gone, request removed");
     }
     sys_close(fd);
     return held;
@@ -946,21 +946,21 @@ static void *gui_hide_thread_fn(void *arg) {
         if (plane < 0 || !h) continue;               /* GUI hasn't pushed a frame yet */
         if (!bset && g_dlsym)
             bset = (blending_set_fn)g_dlsym(RTLD_DEFAULT, "duss_hal_display_plane_blending_set");
-        if (!bset) { NTLOG("gui_hide: no blending_set"); ts.tv_sec = 1; continue; }
+        if (!bset) { NTLOG("fb_gui_hide: no blending_set"); ts.tv_sec = 1; continue; }
         /* stock GUI blending (/proc/display/plane): per-pixel alpha, gfx0
          * order 2, gfx1 order 1, no offset. Hidden: global alpha 0. */
         gui_blend_t b = { 1, (unsigned char)(want ? 1 : 0), 0, 0, want ? 0u : 255u, 0,
                           (unsigned char)(plane == 6 ? 1 : 2), {0, 0}, 0, 0, 0 };
         int r = bset(h, (signed char)plane, &b);
-        if (r != 0) { NTLOG_INT("gui_hide: blending_set failed r=", r); continue; }
+        if (r != 0) { NTLOG_INT("fb_gui_hide: blending_set failed r=", r); continue; }
         hidden = want;
         if (hidden) {
             int fd = (int)sys_openat(AT_FDCWD, GUI_HIDDEN_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (fd >= 0) sys_close(fd);
-            NTLOG("gui_hide: GUI plane hidden");
+            NTLOG("fb_gui_hide: GUI plane hidden");
         } else {
             sys_unlinkat(AT_FDCWD, GUI_HIDDEN_PATH, 0);
-            NTLOG("gui_hide: GUI plane restored");
+            NTLOG("fb_gui_hide: GUI plane restored");
         }
     }
     return 0;
