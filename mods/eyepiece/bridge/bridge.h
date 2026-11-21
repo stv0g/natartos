@@ -68,6 +68,10 @@ int  dispout_push(dispout_t *o, void *fb);
 void dispout_close(dispout_t *o);
 void dispout_qsync_off(void);
 
+/* rndis.c — USB network (RNDIS + DHCP) next to adb; 0 = active */
+int rndis_setup(void);
+#define RNDIS_ADDR "192.168.60.2"
+
 /* headtrack.c — head attitude from the goggles' MCU (100 Hz, no drone).
  * The DJI bus clients run in a forked helper process (isolates DJI's
  * framework init + signal handlers from the HAL used by hwdec).          */
