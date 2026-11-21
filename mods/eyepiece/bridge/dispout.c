@@ -12,8 +12,9 @@
  *   duss_hal_display_push_frame(disp, plane, fb)        pop_cb(inst, plane, fb, user) when the
  *                                                       display is done with fb → back to decoder
  *
- * The GUI planes (GRAPH0/1) sit above VIDEO0; eyepiece_bridge makes them transparent
- * by publishing an all-alpha-0 frame through the natartos overlay.
+ * The GUI planes (GRAPH0/1) sit above VIDEO0 (the driver allows orders 0..2 only, so
+ * VIDEO0 can't go on top, and only a plane's owner may change its blending): the
+ * natartos overlay hides the GUI plane for us (gui_hide in eyepiece_bridge.c).
  */
 #include <dlfcn.h>
 #include <pthread.h>

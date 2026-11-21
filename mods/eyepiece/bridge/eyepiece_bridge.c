@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "bridge.h"
+#include "waiting_h264.h"
 
 /* ---- options ------------------------------------------------------------ */
 static int  opt_port = EP_PORT;
@@ -286,6 +287,7 @@ static unsigned g_tring_i;
 
 static void hw_frame(void *user, const yuv_img_t *img, uint64_t pts) {
     (void)user;
+    if (!pts) return;                /* the waiting screen, not a PC frame */
     uint64_t t0 = now_us(), t_recv = 0, t_sub = 0;
     for (unsigned i = 0; i < TRING; i++)
         if (g_tring[i].pts == pts) { t_recv = g_tring[i].t_recv; t_sub = g_tring[i].t_sub; break; }
@@ -328,8 +330,19 @@ static void *decode_thread(void *arg) {
             if (!st.width) { st.width = (uint16_t)opt_fb_w; st.height = (uint16_t)opt_fb_h; }
             st.codec = a.codec;
             if (hw && (st.width != hw_cfg.width || st.height != hw_cfg.height || st.codec != hw_cfg.codec)) {
-                vlog("hwdec: stream changed → reopening");
-                hwdec_close(hw); hw = NULL;
+                /* Reopening the VC8000D in the same process crashes in DJI's
+                 * decoder/ION teardown (coredumps), and the display has no
+                 * scaler, so a smaller stream would only be a small picture in
+                 * the middle anyway: refuse it. The PC scales to the panel.  */
+                vlog("stream %ux%u %s refused: the goggles need %ux%u H.264 (no display scaler; "
+                     "scale on the PC)", st.width, st.height, st.codec == EP_CODEC_HEVC ? "HEVC" : "H.264",
+                     hw_cfg.width, hw_cfg.height);
+                pthread_mutex_lock(&g_tx_mu);
+                if (g_cfd >= 0) shutdown(g_cfd, SHUT_RDWR);     /* serve_client cleans up */
+                pthread_mutex_unlock(&g_tx_mu);
+                pthread_mutex_lock(&g_q_mu); q_clear_locked(); g_need_key = 1; pthread_mutex_unlock(&g_q_mu);
+                free(a.buf);
+                continue;
             }
             if (!hw) {
                 if (!a.key) { free(a.buf); continue; }      /* (re)start on an IDR */
@@ -370,11 +383,63 @@ static void *decode_thread(void *arg) {
 }
 
 /* ---- connection handling -------------------------------------------------- */
-/* ---- on-screen status (fb_shared via the natartos overlay) ---------------- */
+/* ---- hiding the GUI ----------------------------------------------------------
+ * Video goes to the VIDEO0 plane, which lies below the GUI plane. The natartos
+ * overlay (inside dji_glasses, the only process allowed to change the GUI
+ * plane) sets the GUI plane to global alpha 0 while we hold flock(LOCK_EX) on
+ * gui_hide, and acknowledges with gui_hidden. The GUI's buffers are never
+ * touched and it keeps rendering, so nothing has to be restored or repainted
+ * on exit; if we die, the kernel drops the lock and the overlay restores the
+ * GUI by itself. The waiting screen is a pre-encoded IDR (gen_waiting.sh)
+ * decoded onto VIDEO0 like a PC frame.
+ * Overlays without gui_hide don't acknowledge → the fb_shared path below
+ * (GUI made transparent by painting into its buffers through the overlay).  */
+static int g_hide_fd = -1;
+static int g_gui_hidden;
+
+static int gui_hide_begin(void) {
+    int fd = open(tmp_path("gui_hide"), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX) < 0) { close(fd); return -1; }
+    char b[16];
+    int n = snprintf(b, sizeof(b), "%d\n", (int)getpid());
+    if (ftruncate(fd, 0) == 0) (void)!pwrite(fd, b, (size_t)n, 0);
+    for (int i = 0; i < 50; i++) {                       /* overlay polls every 20 ms */
+        if (access(tmp_path("gui_hidden"), F_OK) == 0) { g_hide_fd = fd; return 0; }
+        usleep(20000);
+    }
+    unlink(tmp_path("gui_hide"));
+    close(fd);
+    return -1;
+}
+
+static void gui_hide_end(void) {
+    if (g_hide_fd < 0) return;
+    unlink(tmp_path("gui_hide"));
+    close(g_hide_fd);
+    g_hide_fd = -1;
+    for (int i = 0; i < 25 && access(tmp_path("gui_hidden"), F_OK) == 0; i++) usleep(20000);
+}
+
+/* ---- on-screen status ----------------------------------------------------- */
 static int g_showing_video;
 
 static void show_waiting(void) {
     if (!opt_video) return;
+    if (g_gui_hidden) {
+        const unsigned char *d = opt_back ? waiting_h264_back1 : waiting_h264_back0;
+        unsigned len = opt_back ? waiting_h264_back1_len : waiting_h264_back0_len;
+        uint8_t *b = malloc(len);
+        if (!b) return;
+        memcpy(b, d, len);
+        pthread_mutex_lock(&g_q_mu);
+        memset(&g_stream, 0, sizeof(g_stream));          /* decoder back to 1920x1080 */
+        pthread_mutex_unlock(&g_q_mu);
+        au_t a = { b, len, 0, now_us(), EP_CODEC_H264, 1 };
+        q_push(a);
+        g_showing_video = 0;
+        return;
+    }
     static const char *L1 = "EYEPIECE - WAITING FOR THE PC";
     static const char *L2 = "ON THE PC: EYEPIECE-PC  OR  TOOLYA WEB > EYEPIECE STREAM";
     const char *L3 = opt_back ? "PRESS BACK TO EXIT" : "";
@@ -402,6 +467,7 @@ static void *clear_thread(void *arg) {
 static void show_video(void) {
     if (g_showing_video) return;
     g_showing_video = 1;
+    if (g_gui_hidden) return;           /* nothing above VIDEO0 to clear */
     if (opt_hw_tune.direct_vops && opt_gui_transparent) {
         pthread_t t;
         if (pthread_create(&t, NULL, clear_thread, NULL) == 0) pthread_detach(t);
@@ -654,14 +720,22 @@ int main(int argc, char **argv) {
 
     vlog("eyepiece_bridge v%d starting (port %d, fb %dx%d)", EP_VERSION, opt_port, opt_fb_w, opt_fb_h);
 
-    if (opt_video && fbout_open(&g_fb, opt_fb_w, opt_fb_h) < 0) {
+    if (opt_video && opt_hw_tune.direct_vops) {
+        if (gui_hide_begin() == 0) {
+            g_gui_hidden = 1;
+            snprintf(g_flag_path, sizeof(g_flag_path), "%s", tmp_path("gui_hide"));
+            vlog("GUI plane hidden by the overlay; waiting screen on VIDEO0");
+        } else {
+            vlog("overlay has no gui_hide → GUI made transparent through fb_shared");
+        }
+    }
+    if (opt_video && !g_gui_hidden && fbout_open(&g_fb, opt_fb_w, opt_fb_h) < 0) {
         vlog("framebuffer unavailable → head tracking only");
         opt_video = 0;
     }
-    /* until a PC streams: a black screen with instructions (the GUI is hidden
-     * by fb_override anyway — the message says why). The first video AU makes
-     * the GUI layer transparent for the VIDEO0 plane below (show_video).    */
-    show_waiting();
+    /* until a PC streams: a black screen with instructions. fb_shared path:
+     * the GUI is hidden by fb_override; the first video AU makes the GUI
+     * layer transparent for the VIDEO0 plane below (show_video).           */
     /* fork the bus helper before any thread exists */
     if (opt_headtrack && headtrack_spawn(on_pose) < 0)
         vlog("bus head tracking unavailable");
@@ -669,6 +743,7 @@ int main(int argc, char **argv) {
     pthread_t th;
     pthread_create(&th, NULL, pose_thread, NULL); pthread_detach(th);
     if (opt_video) { pthread_create(&th, NULL, decode_thread, NULL); pthread_detach(th); }
+    show_waiting();
     if (opt_back)  { pthread_create(&th, NULL, back_thread, NULL); pthread_detach(th); }
 
     int ls = g_ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -700,7 +775,8 @@ int main(int argc, char **argv) {
     if (ls >= 0) close(ls);
     if (opt_headtrack) headtrack_stop();
     dispout_qsync_off();                 /* panel back to fixed refresh */
-    if (opt_video) fbout_close(&g_fb);   /* removes fb_override → overlay restores the UI */
+    if (g_gui_hidden) gui_hide_end();    /* overlay shows the GUI plane again */
+    else if (opt_video) fbout_close(&g_fb);   /* removes fb_override → overlay restores the UI */
     if (g_log) fclose(g_log);
     _exit(0);   /* don't run DJI framework atexit/destructors */
 }
