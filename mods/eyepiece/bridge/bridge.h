@@ -67,6 +67,7 @@ dispout_t *dispout_open(int vop_mask, int src_w, int src_h, dispout_release_cb r
 int  dispout_push(dispout_t *o, void *fb);
 void dispout_close(dispout_t *o);
 void dispout_qsync_off(void);
+void dispout_stereo_off(void);
 
 /* rndis.c — USB network (RNDIS + DHCP) next to adb; 0 = active */
 int rndis_setup(void);
