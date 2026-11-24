@@ -36,7 +36,9 @@ decode, head tracking).
    connects.
 2. On the PC: `adb forward tcp:42420 tcp:42420`, then start eyepiece-pc.
 3. **Back** (a short click) exits the bridge and returns to the goggles UI.
-   **Long-hold Back** (≥ 1.5 s, the overlay's app exit) also stops it.
+  **Long-hold Back** (≥ 1.5 s, the overlay's app exit) also stops it. The PC
+  can disable and re-enable Back-to-exit at runtime; while disabled, Back is
+  passed through to the goggles UI.
 
 A PC disconnect does not end a menu-launched session. The waiting screen comes
 back and another client can connect. Log: `/data/local/tmp/eyepiece.log`.
@@ -55,13 +57,14 @@ Protocol version 1.
 |-----|------|---------|
 | PC → goggles | `0x01` VIDEO | pts, codec + Annex-B access unit (flags bit0 = keyframe) |
 | PC → goggles | `0x02` PING | PC timestamp |
-| PC → goggles | `0x03` CTRL | op: 1 = recenter, 2 = quit |
+| PC → goggles | `0x03` CTRL | op: 1 = recenter, 2 = quit bridge, 3 = head tracking + on byte, 4 = Back-exit + on byte |
 | PC → goggles | `0x04` STREAM | width, height, codec, fps (sent before video) |
 | goggles → PC | `0x81` POSE | yaw/pitch/roll in degrees, device timestamp |
 | goggles → PC | `0x82` PONG | PC + device timestamps |
 | goggles → PC | `0x83` LOG | text |
 | goggles → PC | `0x84` FRAME | per-frame timing / queue / drop stats |
 | goggles → PC | `0x85` INFO | version, framebuffer size, decoder, head-tracking state |
+| goggles → PC | `0x87` BUTTON | device timestamp, source (`gpio_keys`/`omc_keys`), pressed flag, Linux key code; one message per press/release |
 
 [bridge/proto.h](bridge/proto.h) is the authoritative definition.
 

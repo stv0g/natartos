@@ -37,6 +37,8 @@ static int  opt_fb_w = 1920, opt_fb_h = 1080;
 static int  opt_dec_threads = 4, opt_cvt_threads = 4, opt_fast = 0;
 static int  opt_video = 1, opt_headtrack = 1, opt_back = 0, opt_once = 0, opt_mcu_stop = 0;
 static int  opt_any_addr = 0, opt_null_dec = 0;
+static int  g_back_enabled;
+static pthread_mutex_t g_back_mu = PTHREAD_MUTEX_INITIALIZER;
 /* default: VC8000D + zero-copy scan-out on both eyes (measured on device: 60 fps,
  * decode 2.7 ms); falls back to software decode if it fails to open.     */
 static int  opt_hw = 1, opt_hw_frames = 12, opt_hw_sync = -1;   /* -D, -F, -S */
@@ -46,6 +48,19 @@ static int  opt_direct = 1;  /* -O VOP mask (VOP0 drives both eyes via DSI2DSI),
 static hwdec_tune_t opt_hw_tune = { 1, 0, 0, 0, 0 };                 /* -L, -O */
 static int opt_gui_transparent = 1;                               /* -T clears it */
 static const char *opt_log = NULL;   /* default: tmp_path("eyepiece.log") */
+
+static int back_enabled(void) {
+    pthread_mutex_lock(&g_back_mu);
+    int enabled = g_back_enabled;
+    pthread_mutex_unlock(&g_back_mu);
+    return enabled;
+}
+
+static void set_back_enabled(int enabled) {
+    pthread_mutex_lock(&g_back_mu);
+    g_back_enabled = enabled != 0;
+    pthread_mutex_unlock(&g_back_mu);
+}
 
 /* ---- logging / time ------------------------------------------------------ */
 static FILE *g_log;
@@ -162,7 +177,8 @@ static void *pose_thread(void *arg) {
         uint64_t t = now_us();
         if (t - last_tick > 500000) {
             last_tick = t;
-            if (opt_video && fbout_stop_requested()) {
+            if (opt_video && back_enabled() && fbout_stop_requested()) {
+                unlink(tmp_path("fb_stop"));
                 vlog("fb_stop seen (long-hold Back) → exiting");
                 g_exit = 1;
             }
@@ -185,7 +201,7 @@ static int open_input(const char *want, const char *fallback) {
     char path[32], name[64];
     for (int n = 0; n < 10; n++) {
         snprintf(path, sizeof(path), "/dev/input/event%d", n);
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) continue;
         if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) > 0) {
             name[sizeof(name) - 1] = 0;
@@ -193,7 +209,12 @@ static int open_input(const char *want, const char *fallback) {
         }
         close(fd);
     }
-    return open(fallback, O_RDONLY | O_CLOEXEC);
+    return open(fallback, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+}
+
+static void send_button_event(int source, uint16_t code, int pressed) {
+    ep_button_t event = { now_us(), (uint8_t)source, (uint8_t)(pressed != 0), code };
+    tx(EP_BUTTON, &event, sizeof(event));
 }
 
 /* -b: the goggles' buttons belong to the bridge while it runs. Both key
@@ -211,35 +232,55 @@ static void *back_thread(void *arg) {
         { .fd = open_input("gpio_keys", "/dev/input/event0"), .events = POLLIN },
         { .fd = open_input("omc_keys",  "/dev/input/event3"), .events = POLLIN },
     };
-    if (pf[0].fd < 0) { vlog("back: cannot open gpio_keys: %s", strerror(errno)); return NULL; }
-    for (int i = 0; i < 2; i++)
-        if (pf[i].fd >= 0 && ioctl(pf[i].fd, EVIOCGRAB, 1) < 0)
-            vlog("back: grab %d failed: %s", i, strerror(errno));
-    vlog("back: buttons grabbed (gpio_keys%s)", pf[1].fd >= 0 ? " + omc_keys" : "");
-    uint64_t t_start = now_us(), t_down = 0;
+    if (pf[0].fd < 0) vlog("back: cannot open gpio_keys: %s", strerror(errno));
+    int enabled = 0;
+    uint64_t t_start = 0, t_down = 0;
     while (!g_exit) {
-        int r = poll(pf, pf[1].fd >= 0 ? 2 : 1, 100);
+        int requested = back_enabled();
+        if (requested != enabled) {
+            for (int i = 0; i < 2; i++) {
+                if (pf[i].fd >= 0 && ioctl(pf[i].fd, EVIOCGRAB, requested) < 0)
+                    vlog("back: %s grab %d failed: %s", requested ? "enable" : "release", i, strerror(errno));
+            }
+            enabled = requested;
+            t_down = 0;
+            if (enabled) {
+                unlink(tmp_path("fb_stop"));
+                for (int i = 0; i < 2; i++)
+                    if (pf[i].fd >= 0)
+                        while (read(pf[i].fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {}
+                t_start = now_us();
+                vlog("back: button exit enabled; grabbed gpio_keys%s", pf[1].fd >= 0 ? " + omc_keys" : "");
+            } else {
+                vlog("back: button exit disabled; released grabs");
+            }
+        }
+        int r = poll(pf, 2, 100);
         if (r < 0 && errno != EINTR) break;
         uint64_t t = now_us();
-        if (t_down && t - t_down >= 1500000) {      /* long hold, no release needed */
+        if (enabled && t_down && t - t_down >= 1500000) {      /* long hold, no release needed */
+            send_button_event(EP_BUTTON_SRC_GPIO_KEYS, KEY_BACK, 0);
             vlog("Back held → exiting");
             g_exit = 1;
             break;
         }
         if (r <= 0) continue;
-        if (pf[1].fd >= 0 && (pf[1].revents & POLLIN))
-            (void)!read(pf[1].fd, &ev, sizeof(ev));   /* 5D: swallowed */
-        if (!(pf[0].revents & POLLIN)) continue;
-        if (read(pf[0].fd, &ev, sizeof(ev)) != (ssize_t)sizeof(ev)) break;
-        if (ev.type != EV_KEY || ev.code != KEY_BACK) continue;
-        vlog("back: key %s at +%.2f s", ev.value ? "down" : "up", (t - t_start) / 1e6);
-        if (t - t_start < 2000000) { t_down = 0; continue; }
-        if (ev.value == 1) { t_down = t; continue; }
-        if (ev.value == 0 && t_down) {
-            vlog("Back clicked → exiting");
-            g_exit = 1;               /* pose_thread wakes accept()/recv() */
+        for (int i = 0; i < 2; i++) {
+            if (pf[i].fd < 0 || !(pf[i].revents & POLLIN)) continue;
+            while (read(pf[i].fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+                if (ev.type != EV_KEY || (ev.value != 0 && ev.value != 1)) continue;
+                send_button_event(i, ev.code, ev.value);
+                if (!enabled || i != 0 || ev.code != KEY_BACK) continue;
+                vlog("back: key %s at +%.2f s", ev.value ? "down" : "up", (t - t_start) / 1e6);
+                if (t - t_start < 2000000) { t_down = 0; continue; }
+                if (ev.value == 1) { t_down = t; continue; }
+                if (ev.value == 0 && t_down) {
+                    vlog("Back clicked → exiting");
+                    g_exit = 1;               /* pose_thread wakes accept()/recv() */
+                }
+                t_down = 0;
+            }
         }
-        t_down = 0;
     }
     for (int i = 0; i < 2; i++) if (pf[i].fd >= 0) close(pf[i].fd);
     return NULL;
@@ -442,8 +483,9 @@ static int g_showing_video;
 static void show_waiting(void) {
     if (!opt_video) return;
     if (g_gui_hidden) {
-        const unsigned char *d = opt_back ? waiting_h264_back1 : waiting_h264_back0;
-        unsigned len = opt_back ? waiting_h264_back1_len : waiting_h264_back0_len;
+        int back = back_enabled();
+        const unsigned char *d = back ? waiting_h264_back1 : waiting_h264_back0;
+        unsigned len = back ? waiting_h264_back1_len : waiting_h264_back0_len;
         uint8_t *b = malloc(len);
         if (!b) return;
         memcpy(b, d, len);
@@ -457,7 +499,7 @@ static void show_waiting(void) {
     }
     static const char *L1 = "EYEPIECE - WAITING FOR THE PC";
     static const char *L2 = "ON THE PC: EYEPIECE-PC  OR  TOOLYA WEB > EYEPIECE STREAM";
-    const char *L3 = opt_back ? "PRESS BACK TO EXIT" : "";
+    const char *L3 = back_enabled() ? "PRESS BACK TO EXIT" : "";
     fbout_fill(&g_fb, 0xff000000u);
     for (int i = 0; i < 2; i++) {
         uint8_t *slot = g_fb.map + 64 + (size_t)i * g_fb.slot;
@@ -554,6 +596,9 @@ static void serve_client(int fd) {
                 vlog("head tracking %s requested", p[1] ? "on" : "off");
                 if (p[1]) { pthread_mutex_lock(&g_pose_mu); g_recenter = 1; pthread_mutex_unlock(&g_pose_mu); }
                 if (opt_headtrack) headtrack_enable(p[1] != 0);
+            } else if (h.len >= 2 && p[0] == EP_OP_BACK) {
+                set_back_enabled(p[1] != 0);
+                vlog("Back exit %s requested", p[1] ? "enabled" : "disabled");
             } else if (h.len >= 1 && p[0] == EP_OP_QUIT) {
                 vlog("quit requested by PC");
                 g_exit = 1;
@@ -701,6 +746,7 @@ int main(int argc, char **argv) {
         default: usage(argv[0]); return 2;
         }
     }
+    set_back_enabled(opt_back);
     if (opt_mcu_stop) {
         /* stopper / manual recovery: stderr only — never touch the running
          * bridge's log file, fb_shared or display                          */
@@ -774,7 +820,7 @@ int main(int argc, char **argv) {
      * open the decoder (IDR on VIDEO0): the PC connects within a second, and a stereo
      * stream needs the decoder opened at its own size (no reopen in one process) */
     if (!(opt_once && g_gui_hidden)) show_waiting();
-    if (opt_back)  { pthread_create(&th, NULL, back_thread, NULL); pthread_detach(th); }
+    pthread_create(&th, NULL, back_thread, NULL); pthread_detach(th);
 
     /* before listening: the switch drops adb for a few seconds (the PC waits for
      * "listening on" in the log) */

@@ -36,15 +36,14 @@ enum {
     EP_LOG    = 0x83,  /* UTF-8 text                                             */
     EP_FRAME  = 0x84,  /* ep_frame_t, one per displayed frame                    */
     EP_INFO   = 0x85,  /* ep_info_t, sent once on connect                        */
+    EP_BUTTON = 0x87,  /* ep_button_t, one press or release per message          */
 };
 
 #define EP_FLAG_KEY 0x01
 
 enum { EP_CODEC_H264 = 0, EP_CODEC_HEVC = 1 };
 enum { EP_OP_RECENTER = 1, EP_OP_QUIT = 2,
-       EP_OP_HEADTRACK = 3 };   /* + u8 on: start/stop the MCU attitude stream (EP_POSE).
-                                   Off until the PC asks; off again on disconnect.
-                                   Bridges without it ignore the op and stream always. */
+    EP_OP_HEADTRACK = 3, EP_OP_BACK = 4 }; /* HEADTRACK/BACK take a following u8 on. */
 
 typedef struct __attribute__((packed)) {
     uint64_t pts_us;   /* PC capture time (PC monotonic clock)                  */
@@ -88,6 +87,15 @@ typedef struct __attribute__((packed)) {
     uint32_t queue_depth;  /* AUs waiting for the decoder                       */
     uint32_t dropped;      /* AUs dropped so far (overflow / waiting for IDR)   */
 } ep_frame_t;
+
+enum { EP_BUTTON_SRC_GPIO_KEYS = 0, EP_BUTTON_SRC_5D = 1 };
+
+typedef struct __attribute__((packed)) {
+    uint64_t t_dev_us; /* goggles monotonic clock when the key event was read */
+    uint8_t  source;   /* EP_BUTTON_SRC_*                                     */
+    uint8_t  pressed;  /* 1 = press, 0 = release; one message per transition  */
+    uint16_t code;     /* Linux EV_KEY code                                    */
+} ep_button_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t version;      /* EP_VERSION                                        */
